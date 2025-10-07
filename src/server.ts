@@ -14,8 +14,8 @@ import paymentRoutes from "./routes/payments";
 
 const app = express();
 // Respect X-Forwarded-* headers (for real client IP behind proxies)
-// Trust proxy settings for better IP detection
-app.set("trust proxy", true); // Trust all proxies
+// Trust proxy settings for better IP detection (single proxy like Render)
+app.set("trust proxy", 1);
 
 // CORS configuration to allow specific origins incl. http://localhost:3001 with credentials
 const allowedOrigins = (process.env.ALLOWED_ORIGINS || "http://localhost:3000,http://localhost:3001,http://localhost:3002").split(",").map(s=>s.trim().replace(/\/$/, ""));
@@ -36,6 +36,8 @@ app.use(helmet());
 app.use(express.json());
 app.use(morgan("dev"));
 app.use(rateLimit({ windowMs: 15 * 60 * 1000, max: 200 }));
+// Optional root response for uptime checks
+app.get("/", (_req, res) => res.send("Backend API is running"));
 
 app.get("/api/health", (_req, res) => res.json({ ok: true }));
 app.use("/api/auth", authRoutes);

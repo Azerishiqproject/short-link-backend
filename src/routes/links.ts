@@ -1,21 +1,53 @@
 import { Router } from "express";
-import rateLimit from "express-rate-limit";
+import rateLimit, { ipKeyGenerator } from "express-rate-limit";
 import crypto from "crypto";
 import { z } from "zod";
 import { Link, Click } from "../models/Link";
+import { Pricing } from "../models/Pricing";
 import { User } from "../models/User";
 import { requireAuth } from "../middleware/auth";
 import { getCountryFromIP, getClientIP } from "../services/geoService";
 import { encodeToken, decodeToken, getSecretOrThrow, rememberNonce, isNonceUsed, getOrCreateAdSession, clearAdSession } from "../utils/linkToken";
 
 const router = Router();
+// =============================
+// Pricing helpers (country-based per click)
+// =============================
+type CountryRateCache = { updatedAt: number; countryToRate: Record<string, number> };
+let pricingCache: CountryRateCache | null = null;
+
+async function loadPricingCache(): Promise<CountryRateCache> {
+  // Cache for 60 seconds to limit DB reads under traffic
+  const needsRefresh = !pricingCache || (Date.now() - pricingCache.updatedAt) > 60_000;
+  if (!needsRefresh) return pricingCache as CountryRateCache;
+  const doc = await Pricing.findOne().lean();
+  const map: Record<string, number> = {};
+  if (doc?.entries?.length) {
+    for (const e of doc.entries as any[]) {
+      // Use audience 'user' and website_traffic as the default basis; unit is per_1000
+      if (e && (e.audience === 'user') && e.country && e.rates && typeof e.rates.website_traffic === 'number') {
+        const perClick = Number(e.rates.website_traffic) / 1000; // convert per_1000 to per click
+        map[e.country.toUpperCase()] = perClick;
+      }
+    }
+  }
+  pricingCache = { updatedAt: Date.now(), countryToRate: map };
+  return pricingCache;
+}
+
+async function getPerClickRate(countryCode: string | undefined): Promise<number> {
+  const fallback = Number(process.env.EARNING_PER_CLICK ?? 0.02);
+  if (!countryCode) return fallback;
+  const cache = await loadPricingCache();
+  return cache.countryToRate[countryCode.toUpperCase()] ?? fallback;
+}
 // Per-user rate limiter: max 10 requests per minute
 const perUserLimiter = rateLimit({
   windowMs: 60 * 1000,
   max: 10,
   standardHeaders: true,
   legacyHeaders: false,
-  keyGenerator: (req: any) => (req?.user?.sub ? String(req.user.sub) : req.ip || "unknown"),
+  keyGenerator: (req: any) => (req?.user?.sub ? String(req.user.sub) : ipKeyGenerator(req)),
 });
 
 const urlRegex = /^https?:\/\//i;
@@ -61,14 +93,29 @@ router.get("/", requireAuth, async (req, res) => {
 
 router.get("/stats", requireAuth, perUserLimiter, async (req, res) => {
   const ownerId = (req as any).user.sub;
-  const links = await Link.find({ ownerId }).select("clicks disabled createdAt slug targetUrl");
+  const links = await Link.find({ ownerId }).select("_id clicks disabled createdAt slug targetUrl");
   const totalClicks = links.reduce((sum, l) => sum + (l.clicks || 0), 0);
-  const rate = Number(process.env.EARNING_PER_CLICK ?? 0.02); // default 0.02
-  const totalEarnings = Number((totalClicks * rate).toFixed(4));
+  // Compute earnings by country using Clicks aggregation and pricing table
+  let totalEarnings = 0;
+  if (links.length > 0) {
+    const linkIds = links.map((l:any)=>l._id);
+    const grouped = await Click.aggregate([
+      { $match: { linkId: { $in: linkIds } } },
+      { $group: { _id: "$country", clicks: { $sum: 1 } } },
+    ]);
+    const cache = await loadPricingCache();
+    for (const row of grouped) {
+      const cc = String(row._id || '').toUpperCase();
+      const count = Number(row.clicks || 0);
+      const rate = cache.countryToRate[cc] ?? Number(process.env.EARNING_PER_CLICK ?? 0.02);
+      totalEarnings += count * rate;
+    }
+    totalEarnings = Number(totalEarnings.toFixed(4));
+  }
   return res.json({
     totalClicks,
     totalEarnings,
-    earningPerClick: rate,
+    earningPerClick: Number(process.env.EARNING_PER_CLICK ?? 0.02),
     links: links.map((l) => ({
       id: l._id,
       slug: l.slug,
@@ -76,7 +123,8 @@ router.get("/stats", requireAuth, perUserLimiter, async (req, res) => {
       disabled: l.disabled,
       createdAt: l.createdAt,
       targetUrl: l.targetUrl,
-      earnings: Number(((l.clicks || 0) * rate).toFixed(4)),
+      // Note: per-link earnings require per-country breakdown; keep simple estimate here
+      earnings: Number(((l.clicks || 0) * Number(process.env.EARNING_PER_CLICK ?? 0.02)).toFixed(4)),
     })),
   });
 });
@@ -338,7 +386,7 @@ router.post('/:id/click', async (req, res) => {
   await link.save();
   
   // Kullanıcıya kazanç ekle (her tıklama için)
-  const earningRate = Number(process.env.EARNING_PER_CLICK ?? 0.02);
+  const earningRate = await getPerClickRate(country);
   await User.findByIdAndUpdate(link.ownerId, { 
     $inc: { earned_balance: earningRate } 
   });
@@ -432,7 +480,7 @@ router.post('/impression', async (req, res) => {
         await link.save();
         
         // Kullanıcıya kazanç ekle (her tıklama için)
-        const earningRate = Number(process.env.EARNING_PER_CLICK ?? 0.02);
+        const earningRate = await getPerClickRate(country);
         await User.findByIdAndUpdate(link.ownerId, { 
           $inc: { earned_balance: earningRate } 
         });
