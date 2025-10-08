@@ -19,7 +19,8 @@ router.get("/", async (_req, res, next) => {
 const upsertSchema = zod_1.z.object({
     entries: zod_1.z.array(zod_1.z.object({
         audience: zod_1.z.enum(["user", "advertiser"]),
-        country: zod_1.z.string().min(2),
+        // Expect ISO-3166 alpha-2 code directly (e.g., TR, AZ)
+        country: zod_1.z.string().regex(/^[A-Za-z]{2}$/),
         unit: zod_1.z.literal("per_1000").optional(),
         rates: zod_1.z.object({
             google_review: zod_1.z.number().min(0),
@@ -34,7 +35,9 @@ router.put("/", auth_1.requireAdmin, async (req, res, next) => {
         const parsed = upsertSchema.safeParse(req.body);
         if (!parsed.success)
             return res.status(400).json({ error: parsed.error.flatten() });
-        const doc = await Pricing_1.Pricing.findOneAndUpdate({}, { entries: parsed.data.entries }, { new: true, upsert: true });
+        // Save as provided, enforcing ISO-2 via schema; default unit
+        const entries = parsed.data.entries.map((e) => ({ ...e, country: e.country.toUpperCase(), unit: e.unit || "per_1000" }));
+        const doc = await Pricing_1.Pricing.findOneAndUpdate({}, { entries }, { new: true, upsert: true });
         return res.json({ entries: doc.entries });
     }
     catch (e) {

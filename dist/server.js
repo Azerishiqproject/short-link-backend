@@ -16,10 +16,11 @@ const links_1 = __importDefault(require("./routes/links"));
 const campaigns_1 = __importDefault(require("./routes/campaigns"));
 const pricing_1 = __importDefault(require("./routes/pricing"));
 const payments_1 = __importDefault(require("./routes/payments"));
+const security_1 = require("./middleware/security");
 const app = (0, express_1.default)();
 // Respect X-Forwarded-* headers (for real client IP behind proxies)
-// Trust proxy settings for better IP detection
-app.set("trust proxy", true); // Trust all proxies
+// Trust proxy settings for better IP detection (single proxy like Render)
+app.set("trust proxy", 1);
 // CORS configuration to allow specific origins incl. http://localhost:3001 with credentials
 const allowedOrigins = (process.env.ALLOWED_ORIGINS || "http://localhost:3000,http://localhost:3001,http://localhost:3002").split(",").map(s => s.trim().replace(/\/$/, ""));
 function isAllowedOrigin(origin) {
@@ -38,9 +39,16 @@ function isAllowedOrigin(origin) {
 app.use((0, cors_1.default)());
 app.options(/.*/, (0, cors_1.default)());
 app.use((0, helmet_1.default)());
-app.use(express_1.default.json());
+app.use(security_1.securityHeaders);
+app.use(security_1.sanitizeInput);
+app.use(security_1.rateLimitDbOperations);
+app.use(security_1.logDbOperations);
+app.use(express_1.default.json({ limit: '10mb' })); // Limit JSON payload size
+app.use(express_1.default.urlencoded({ extended: true, limit: '10mb' }));
 app.use((0, morgan_1.default)("dev"));
 app.use((0, express_rate_limit_1.default)({ windowMs: 15 * 60 * 1000, max: 200 }));
+// Optional root response for uptime checks
+app.get("/", (_req, res) => res.send("Backend API is running"));
 app.get("/api/health", (_req, res) => res.json({ ok: true }));
 app.use("/api/auth", authRoutes);
 app.use("/api/links", links_1.default);

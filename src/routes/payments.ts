@@ -78,10 +78,39 @@ router.post("/", requireAuth, async (req, res, next) => {
 });
 
 // Admin: list all payments
-router.get("/admin/all", requireAdmin, async (_req, res, next) => {
+router.get("/admin/all", requireAdmin, async (req, res, next) => {
   try {
-    const items = await Payment.find().sort({ createdAt: -1 }).limit(500);
-    return res.json({ payments: items });
+    // Pagination parameters
+    const page = Math.max(1, parseInt(String(req.query.page || 1)));
+    const limit = Math.min(100, Math.max(10, parseInt(String(req.query.limit || 20))));
+    const skip = (page - 1) * limit;
+
+    // Filter parameters
+    const category = req.query.category as string;
+    const audience = req.query.audience as string;
+
+    // Build filter object
+    const filter: any = {};
+    if (category) filter.category = category;
+    if (audience) filter.audience = audience;
+
+    const totalPayments = await Payment.countDocuments(filter);
+    const items = await Payment.find(filter)
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(limit);
+
+    return res.json({ 
+      payments: items,
+      pagination: {
+        page,
+        limit,
+        total: totalPayments,
+        totalPages: Math.ceil(totalPayments / limit),
+        hasNext: page < Math.ceil(totalPayments / limit),
+        hasPrev: page > 1,
+      }
+    });
   } catch (e) { next(e); }
 });
 
@@ -120,15 +149,40 @@ router.put("/:id/status", requireAdmin, async (req, res, next) => {
 // Admin: get user withdrawal requests
 router.get("/admin/withdrawals", requireAdmin, async (req, res, next) => {
   try {
-    const items = await Payment.find({ 
+    // Pagination parameters
+    const page = Math.max(1, parseInt(String(req.query.page || 1)));
+    const limit = Math.min(100, Math.max(5, parseInt(String(req.query.limit || 10))));
+    const skip = (page - 1) * limit;
+
+    // Filter parameters
+    const status = req.query.status as string;
+
+    // Build filter object
+    const filter: any = { 
       category: "withdrawal", 
       audience: "user",
       status: { $in: ["pending", "approved", "rejected"] }
-    })
-    .populate("ownerId", "email name fullName iban")
-    .sort({ createdAt: -1 })
-    .limit(100);
-    return res.json({ payments: items });
+    };
+    if (status) filter.status = status;
+
+    const totalWithdrawals = await Payment.countDocuments(filter);
+    const items = await Payment.find(filter)
+      .populate("ownerId", "email name fullName iban")
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(limit);
+
+    return res.json({ 
+      payments: items,
+      pagination: {
+        page,
+        limit,
+        total: totalWithdrawals,
+        totalPages: Math.ceil(totalWithdrawals / limit),
+        hasNext: page < Math.ceil(totalWithdrawals / limit),
+        hasPrev: page > 1,
+      }
+    });
   } catch (e) { next(e); }
 });
 

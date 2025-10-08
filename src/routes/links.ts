@@ -8,6 +8,7 @@ import { User } from "../models/User";
 import { requireAuth } from "../middleware/auth";
 import { getCountryFromIP, getClientIP } from "../services/geoService";
 import { encodeToken, decodeToken, getSecretOrThrow, rememberNonce, isNonceUsed, getOrCreateAdSession, clearAdSession } from "../utils/linkToken";
+import { commonSchemas, mongoSanitize } from "../middleware/security";
 
 const router = Router();
 // =============================
@@ -87,34 +88,37 @@ router.post("/", requireAuth, async (req, res) => {
 
 router.get("/", requireAuth, async (req, res) => {
   const ownerId = (req as any).user.sub;
-  const links = await Link.find({ ownerId }).sort({ createdAt: -1 }).limit(200);
-  return res.json({ links });
+  const page = Math.max(1, parseInt(String(req.query.page || 1)));
+  const limit = Math.min(100, Math.max(10, parseInt(String(req.query.limit || 10))));
+  const skip = (page - 1) * limit;
+
+  const total = await Link.countDocuments({ ownerId });
+  const links = await Link.find({ ownerId })
+    .sort({ createdAt: -1 })
+    .skip(skip)
+    .limit(limit);
+  return res.json({
+    links,
+    pagination: {
+      page,
+      limit,
+      total,
+      totalPages: Math.ceil(total / limit),
+      hasNext: page < Math.ceil(total / limit),
+      hasPrev: page > 1,
+    },
+  });
 });
 
 router.get("/stats", requireAuth, perUserLimiter, async (req, res) => {
   const ownerId = (req as any).user.sub;
-  const links = await Link.find({ ownerId }).select("_id clicks disabled createdAt slug targetUrl");
+  const links = await Link.find({ ownerId }).select("_id clicks earnings disabled createdAt slug targetUrl");
   const totalClicks = links.reduce((sum, l) => sum + (l.clicks || 0), 0);
-  // Compute earnings by country using Clicks aggregation and pricing table
-  let totalEarnings = 0;
-  if (links.length > 0) {
-    const linkIds = links.map((l:any)=>l._id);
-    const grouped = await Click.aggregate([
-      { $match: { linkId: { $in: linkIds } } },
-      { $group: { _id: "$country", clicks: { $sum: 1 } } },
-    ]);
-    const cache = await loadPricingCache();
-    for (const row of grouped) {
-      const cc = String(row._id || '').toUpperCase();
-      const count = Number(row.clicks || 0);
-      const rate = cache.countryToRate[cc] ?? Number(process.env.EARNING_PER_CLICK ?? 0.02);
-      totalEarnings += count * rate;
-    }
-    totalEarnings = Number(totalEarnings.toFixed(4));
-  }
+  // Use link earnings directly (already calculated per country)
+  const totalEarnings = links.reduce((sum, l) => sum + (l.earnings || 0), 0);
   return res.json({
     totalClicks,
-    totalEarnings,
+    totalEarnings: Number(totalEarnings.toFixed(4)),
     earningPerClick: Number(process.env.EARNING_PER_CLICK ?? 0.02),
     links: links.map((l) => ({
       id: l._id,
@@ -123,8 +127,7 @@ router.get("/stats", requireAuth, perUserLimiter, async (req, res) => {
       disabled: l.disabled,
       createdAt: l.createdAt,
       targetUrl: l.targetUrl,
-      // Note: per-link earnings require per-country breakdown; keep simple estimate here
-      earnings: Number(((l.clicks || 0) * Number(process.env.EARNING_PER_CLICK ?? 0.02)).toFixed(4)),
+      earnings: Number((l.earnings || 0).toFixed(4)),
     })),
   });
 });
@@ -165,7 +168,7 @@ function invalidateAnalyticsCacheForLink(linkId: string, ownerId?: string) {
 router.get("/trend", requireAuth, perUserLimiter, async (req, res) => {
   try {
     const ownerId = (req as any).user.sub;
-    const days = Math.min(Math.max(parseInt(String(req.query.days || 30)), 1), 180);
+    const days = Math.min(Math.max(parseInt(String(req.query.days || 30)), 1), 365);
     
     // Check cache first
     const cacheKey = `trend_${ownerId}_${days}`;
@@ -213,6 +216,35 @@ router.get("/trend", requireAuth, perUserLimiter, async (req, res) => {
   }
 });
 
+// Overview: geographic distribution across all user's links
+router.get("/geo", requireAuth, perUserLimiter, async (req, res) => {
+  try {
+    const ownerId = (req as any).user.sub;
+    const days = req.query.days ? Math.min(Math.max(parseInt(String(req.query.days)), 1), 365) : null;
+    const ids = await Link.find({ ownerId }).select("_id").lean();
+    const linkIds = ids.map((d:any)=>d._id);
+    if (!linkIds.length) return res.json({ countryBreakdown: [] });
+    const match: any = { linkId: { $in: linkIds } };
+    if (days) {
+      match.clickedAt = { $gte: new Date(Date.now() - days * 24 * 60 * 60 * 1000) };
+    }
+    const grouped = await Click.aggregate([
+      { $match: match },
+      { $group: { _id: "$country", count: { $sum: 1 } } },
+      { $sort: { count: -1 } },
+    ]);
+    const total = grouped.reduce((s, g)=> s + (g.count || 0), 0) || 1;
+    const countryBreakdown = grouped.map((g:any)=>({
+      country: g._id || 'Unknown',
+      count: g.count || 0,
+      percentage: ((100 * (g.count || 0) / total).toFixed(1)),
+    }));
+    return res.json({ countryBreakdown });
+  } catch (e:any) {
+    return res.status(500).json({ error: e?.message || 'geo-failed' });
+  }
+});
+
 router.get("/slug/:slug", async (req, res) => {
   const slug = req.params.slug;
   const link = await Link.findOne({ slug });
@@ -222,16 +254,30 @@ router.get("/slug/:slug", async (req, res) => {
 
 router.get("/:id", requireAuth, async (req, res) => {
   const { id } = req.params;
+  
+  // Validate ObjectId format to prevent injection
+  if (!mongoSanitize.isValidObjectId(id)) {
+    return res.status(400).json({ error: "Invalid link ID format" });
+  }
+  
   const ownerId = (req as any).user.sub;
-  const link = await Link.findOne({ _id: id, ownerId });
+  const sanitizedQuery = mongoSanitize.sanitizeQuery({ _id: id, ownerId });
+  const link = await Link.findOne(sanitizedQuery);
   if (!link) return res.status(404).json({ error: "Not found" });
   return res.json({ link });
 });
 
 router.get("/:id/stats", requireAuth, async (req, res) => {
   const { id } = req.params;
+  
+  // Validate ObjectId format to prevent injection
+  if (!mongoSanitize.isValidObjectId(id)) {
+    return res.status(400).json({ error: "Invalid link ID format" });
+  }
+  
   const ownerId = (req as any).user.sub;
-  const link = await Link.findOne({ _id: id, ownerId }).select("clicks lastClickedAt createdAt slug targetUrl disabled");
+  const sanitizedQuery = mongoSanitize.sanitizeQuery({ _id: id, ownerId });
+  const link = await Link.findOne(sanitizedQuery).select("clicks lastClickedAt createdAt slug targetUrl disabled");
   if (!link) return res.status(404).json({ error: "Not found" });
   const rate = Number(process.env.EARNING_PER_CLICK ?? 0.02);
   const earnings = Number(((link.clicks || 0) * rate).toFixed(4));
@@ -252,8 +298,15 @@ router.get("/:id/analytics", requireAuth, async (req, res) => {
   const { id } = req.params;
   const ownerId = (req as any).user.sub;
   
-  // Check cache first
-  const cacheKey = `analytics_${id}_${ownerId}`;
+  // Pagination parameters
+  const page = Math.max(1, parseInt(String(req.query.page || 1)));
+  const limit = Math.min(100, Math.max(10, parseInt(String(req.query.limit || 10))));
+  const skip = (page - 1) * limit;
+  // Optional range filter (days)
+  const daysParam = req.query.days ? Math.min(Math.max(parseInt(String(req.query.days)), 1), 365) : null;
+  
+  // Check cache first (include pagination and days in cache key)
+  const cacheKey = `analytics_${id}_${ownerId}_${page}_${limit}_${daysParam ?? 'all'}`;
   const cached = cache.get(cacheKey);
   if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
     return res.json(cached.data);
@@ -262,11 +315,22 @@ router.get("/:id/analytics", requireAuth, async (req, res) => {
   const link = await Link.findOne({ _id: id, ownerId });
   if (!link) return res.status(404).json({ error: "Not found" });
   
-  // Get click analytics grouped by country
-  const clicks = await Click.find({ linkId: id }).sort({ clickedAt: -1 });
+  // Build time filter if provided
+  const sinceFilter: any = daysParam ? { clickedAt: { $gte: new Date(Date.now() - daysParam * 24 * 60 * 60 * 1000) } } : {};
+  // Get total click count for pagination
+  const totalClicks = await Click.countDocuments({ linkId: id, ...sinceFilter });
   
-  // Group by country
-  const countryStats = clicks.reduce((acc: any, click) => {
+  // Get click analytics grouped by country (filtered by days if provided)
+  const allClicks = await Click.find({ linkId: id, ...sinceFilter }).sort({ clickedAt: -1 });
+  
+  // Get paginated recent clicks
+  const recentClicks = await Click.find({ linkId: id, ...sinceFilter })
+    .sort({ clickedAt: -1 })
+    .skip(skip)
+    .limit(limit);
+  
+  // Group by country (using all clicks for country breakdown)
+  const countryStats = allClicks.reduce((acc: any, click) => {
     const country = click.country;
     if (!acc[country]) {
       acc[country] = { count: 0, clicks: [] };
@@ -277,6 +341,7 @@ router.get("/:id/analytics", requireAuth, async (req, res) => {
       userAgent: click.userAgent,
       referer: click.referer,
       clickedAt: click.clickedAt,
+      earnings: click.earnings || 0,
     });
     return acc;
   }, {});
@@ -286,13 +351,13 @@ router.get("/:id/analytics", requireAuth, async (req, res) => {
     .map(([country, data]: [string, any]) => ({
       country,
       count: data.count,
-      percentage: ((data.count / clicks.length) * 100).toFixed(1),
+      percentage: ((data.count / allClicks.length) * 100).toFixed(1),
       clicks: data.clicks,
     }))
     .sort((a, b) => b.count - a.count);
   
-  // Get daily trend for this specific link (last 7 days)
-  const days = 7;
+  // Get daily trend for this specific link (range)
+  const days = daysParam ?? 7;
   const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
   const mongoose = await import('mongoose');
   const linkObjectId = new mongoose.Types.ObjectId(id);
@@ -319,10 +384,25 @@ router.get("/:id/analytics", requireAuth, async (req, res) => {
   
   const data = {
     linkId: id,
-    totalClicks: clicks.length,
+    totalClicks,
     countryBreakdown,
-    recentClicks: clicks.slice(0, 10), // Last 10 clicks
+    recentClicks: recentClicks.map(click => ({
+      ip: click.ip,
+      country: click.country,
+      userAgent: click.userAgent,
+      referer: click.referer,
+      clickedAt: click.clickedAt,
+      earnings: click.earnings || 0,
+    })),
     trend, // Daily trend data
+    pagination: {
+      page,
+      limit,
+      total: totalClicks,
+      totalPages: Math.ceil(totalClicks / limit),
+      hasNext: page < Math.ceil(totalClicks / limit),
+      hasPrev: page > 1,
+    },
   };
   
   // Cache the result
@@ -371,22 +451,25 @@ router.post('/:id/click', async (req, res) => {
   const clientIP = getClientIP(req);
   const country = getCountryFromIP(clientIP);
   
-  // Log detailed click data
+  // Kullanıcıya kazanç ekle (her tıklama için)
+  const earningRate = await getPerClickRate(country);
+  
+  // Log detailed click data with earnings
   await Click.create({
     linkId: id,
     ip: clientIP,
     country,
     userAgent: req.headers['user-agent'],
     referer: req.headers.referer,
+    earnings: earningRate,
   });
   
-  // Update link click count
+  // Update link click count and earnings
   link.clicks += 1;
+  link.earnings = (link.earnings || 0) + earningRate;
   link.lastClickedAt = new Date();
   await link.save();
   
-  // Kullanıcıya kazanç ekle (her tıklama için)
-  const earningRate = await getPerClickRate(country);
   await User.findByIdAndUpdate(link.ownerId, { 
     $inc: { earned_balance: earningRate } 
   });
@@ -466,21 +549,24 @@ router.post('/impression', async (req, res) => {
       if (link) {
         const country = getCountryFromIP(ip);
         
+        // Kullanıcıya kazanç ekle (her tıklama için)
+        const earningRate = await getPerClickRate(country);
+        
         await Click.create({
           linkId: session.linkId,
           ip: ip,
           country,
           userAgent: ua,
           referer: req.headers.referer,
+          earnings: earningRate,
         });
         
-        // Update link click count
+        // Update link click count and earnings
         link.clicks = (link.clicks || 0) + 1;
+        link.earnings = (link.earnings || 0) + earningRate;
         link.lastClickedAt = new Date();
         await link.save();
         
-        // Kullanıcıya kazanç ekle (her tıklama için)
-        const earningRate = await getPerClickRate(country);
         await User.findByIdAndUpdate(link.ownerId, { 
           $inc: { earned_balance: earningRate } 
         });

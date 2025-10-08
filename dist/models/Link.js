@@ -42,6 +42,7 @@ const clickSchema = new mongoose_1.Schema({
     userAgent: { type: String },
     referer: { type: String },
     clickedAt: { type: Date, default: Date.now },
+    earnings: { type: Number, default: 0 }, // Her tıklama için kazanılan miktar
 }, { timestamps: true });
 const linkSchema = new mongoose_1.Schema({
     slug: { type: String, required: true, unique: true, index: true },
@@ -49,6 +50,7 @@ const linkSchema = new mongoose_1.Schema({
     ownerId: { type: mongoose_1.Schema.Types.ObjectId, ref: "User", required: true, index: true },
     disabled: { type: Boolean, default: false },
     clicks: { type: Number, default: 0 },
+    earnings: { type: Number, default: 0 }, // Link başına toplam kazanç
     lastClickedAt: { type: Date },
     expiresAt: { type: Date },
 }, { timestamps: true });

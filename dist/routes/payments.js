@@ -75,10 +75,37 @@ router.post("/", auth_1.requireAuth, async (req, res, next) => {
     }
 });
 // Admin: list all payments
-router.get("/admin/all", auth_1.requireAdmin, async (_req, res, next) => {
+router.get("/admin/all", auth_1.requireAdmin, async (req, res, next) => {
     try {
-        const items = await Payment_1.Payment.find().sort({ createdAt: -1 }).limit(500);
-        return res.json({ payments: items });
+        // Pagination parameters
+        const page = Math.max(1, parseInt(String(req.query.page || 1)));
+        const limit = Math.min(100, Math.max(10, parseInt(String(req.query.limit || 20))));
+        const skip = (page - 1) * limit;
+        // Filter parameters
+        const category = req.query.category;
+        const audience = req.query.audience;
+        // Build filter object
+        const filter = {};
+        if (category)
+            filter.category = category;
+        if (audience)
+            filter.audience = audience;
+        const totalPayments = await Payment_1.Payment.countDocuments(filter);
+        const items = await Payment_1.Payment.find(filter)
+            .sort({ createdAt: -1 })
+            .skip(skip)
+            .limit(limit);
+        return res.json({
+            payments: items,
+            pagination: {
+                page,
+                limit,
+                total: totalPayments,
+                totalPages: Math.ceil(totalPayments / limit),
+                hasNext: page < Math.ceil(totalPayments / limit),
+                hasPrev: page > 1,
+            }
+        });
     }
     catch (e) {
         next(e);
@@ -119,15 +146,37 @@ router.put("/:id/status", auth_1.requireAdmin, async (req, res, next) => {
 // Admin: get user withdrawal requests
 router.get("/admin/withdrawals", auth_1.requireAdmin, async (req, res, next) => {
     try {
-        const items = await Payment_1.Payment.find({
+        // Pagination parameters
+        const page = Math.max(1, parseInt(String(req.query.page || 1)));
+        const limit = Math.min(100, Math.max(5, parseInt(String(req.query.limit || 10))));
+        const skip = (page - 1) * limit;
+        // Filter parameters
+        const status = req.query.status;
+        // Build filter object
+        const filter = {
             category: "withdrawal",
             audience: "user",
             status: { $in: ["pending", "approved", "rejected"] }
-        })
+        };
+        if (status)
+            filter.status = status;
+        const totalWithdrawals = await Payment_1.Payment.countDocuments(filter);
+        const items = await Payment_1.Payment.find(filter)
             .populate("ownerId", "email name fullName iban")
             .sort({ createdAt: -1 })
-            .limit(100);
-        return res.json({ payments: items });
+            .skip(skip)
+            .limit(limit);
+        return res.json({
+            payments: items,
+            pagination: {
+                page,
+                limit,
+                total: totalWithdrawals,
+                totalPages: Math.ceil(totalWithdrawals / limit),
+                hasNext: page < Math.ceil(totalWithdrawals / limit),
+                hasPrev: page > 1,
+            }
+        });
     }
     catch (e) {
         next(e);

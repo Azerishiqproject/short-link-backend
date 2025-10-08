@@ -11,6 +11,12 @@ import linkRoutes from "./routes/links";
 import campaignRoutes from "./routes/campaigns";
 import pricingRoutes from "./routes/pricing";
 import paymentRoutes from "./routes/payments";
+import { 
+  sanitizeInput, 
+  rateLimitDbOperations, 
+  logDbOperations, 
+  securityHeaders 
+} from "./middleware/security";
 
 const app = express();
 // Respect X-Forwarded-* headers (for real client IP behind proxies)
@@ -33,7 +39,12 @@ function isAllowedOrigin(origin?: string): boolean {
 app.use(cors());
 app.options(/.*/, cors());
 app.use(helmet());
-app.use(express.json());
+app.use(securityHeaders);
+app.use(sanitizeInput);
+app.use(rateLimitDbOperations);
+app.use(logDbOperations);
+app.use(express.json({ limit: '10mb' })); // Limit JSON payload size
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 app.use(morgan("dev"));
 app.use(rateLimit({ windowMs: 15 * 60 * 1000, max: 200 }));
 // Optional root response for uptime checks

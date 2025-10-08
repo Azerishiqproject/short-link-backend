@@ -11,7 +11,22 @@ const User_1 = require("../models/User");
 const Campaign_1 = require("../models/Campaign");
 const auth_1 = require("../middleware/auth");
 const mailer_1 = require("../services/mailer");
+const security_1 = require("../middleware/security");
 const router = (0, express_1.Router)();
+// In-memory failed login tracker by IP
+// Key: IP address, Value: counters and timers
+const failedLoginTracker = new Map();
+const FAILED_LOGIN_WINDOW_MS = 10 * 60 * 1000; // 10 minutes
+const FAILED_LOGIN_MAX_ATTEMPTS = 5; // after 5 failed attempts -> lock for window
+// In-memory registration tracker by IP
+const registrationTracker = new Map();
+const REGISTRATION_WINDOW_MS = 10 * 60 * 1000; // 10 minutes
+const REGISTRATION_MAX_ATTEMPTS = 3; // after 3 registration attempts -> lock for window
+function getClientIp(req) {
+    const xf = req.headers["x-forwarded-for"] || "";
+    const forwarded = xf.split(",")[0].trim();
+    return forwarded || req.ip || req.connection?.remoteAddress || "unknown";
+}
 // Simple ping + one-time SMTP verification
 router.get("/ping", (_req, res) => res.json({ ok: true }));
 (0, mailer_1.verifySmtp)().catch(() => { });
@@ -26,10 +41,16 @@ const signAccess = (payload) => jsonwebtoken_1.default.sign(payload, getJwtSecre
 const signRefresh = (payload) => jsonwebtoken_1.default.sign(payload, getJwtSecret(), { expiresIn: "7d" });
 // Compute display wallet values based on spend
 async function walletView(userId) {
-    const user = await User_1.User.findById(userId).select("email name role createdAt available_balance reserved_balance earned_balance reserved_earned_balance iban fullName paymentDescription").lean();
+    // Validate ObjectId format to prevent injection
+    if (!security_1.mongoSanitize.isValidObjectId(userId)) {
+        throw new Error("Invalid user ID format");
+    }
+    const sanitizedUserId = security_1.mongoSanitize.sanitizeQuery({ _id: userId });
+    const user = await User_1.User.findById(sanitizedUserId._id).select("email name role createdAt available_balance reserved_balance earned_balance reserved_earned_balance iban fullName paymentDescription").lean();
     if (!user)
         return null;
-    const campaigns = await Campaign_1.Campaign.find({ ownerId: userId }).select("budget spent").lean();
+    const sanitizedOwnerQuery = security_1.mongoSanitize.sanitizeQuery({ ownerId: userId });
+    const campaigns = await Campaign_1.Campaign.find(sanitizedOwnerQuery).select("budget spent").lean();
     const totalSpent = campaigns.reduce((s, c) => s + (c.spent || 0), 0);
     const u = user;
     const display_available = Math.max(0, (u.available_balance || 0) - totalSpent);
@@ -37,12 +58,21 @@ async function walletView(userId) {
     return { ...user, display_available, display_reserved };
 }
 const registerSchema = zod_1.z.object({
-    email: zod_1.z.string().email(),
-    password: zod_1.z.string().min(6),
-    name: zod_1.z.string().min(2).max(50).optional(),
+    email: security_1.commonSchemas.email,
+    password: security_1.commonSchemas.password,
+    name: security_1.commonSchemas.text.min(2).max(50).optional(),
     role: zod_1.z.enum(["user", "advertiser"]).optional(),
 });
 router.post("/register", async (req, res) => {
+    const ip = getClientIp(req);
+    const tracker = registrationTracker.get(ip);
+    const now = Date.now();
+    // If IP is currently locked out, short-circuit
+    if (tracker?.lockUntilMs && tracker.lockUntilMs > now) {
+        const retryAfterSec = Math.max(1, Math.ceil((tracker.lockUntilMs - now) / 1000));
+        res.setHeader("Retry-After", String(retryAfterSec));
+        return res.status(429).json({ error: `Çok fazla kayıt denemesi. Lütfen ${retryAfterSec} saniye sonra tekrar deneyin.` });
+    }
     const parsed = registerSchema.safeParse(req.body);
     if (!parsed.success)
         return res.status(400).json({ error: parsed.error.flatten() });
@@ -50,24 +80,95 @@ router.post("/register", async (req, res) => {
     const exists = await User_1.User.findOne({ email });
     if (exists)
         return res.status(409).json({ error: "Email already in use" });
+    // Count registration attempt
+    const prev = registrationTracker.get(ip);
+    if (!prev || now - prev.firstMs > REGISTRATION_WINDOW_MS) {
+        registrationTracker.set(ip, { count: 1, firstMs: now });
+    }
+    else {
+        const nextCount = prev.count + 1;
+        const next = { count: nextCount, firstMs: prev.firstMs };
+        if (nextCount >= REGISTRATION_MAX_ATTEMPTS) {
+            next.lockUntilMs = now + REGISTRATION_WINDOW_MS;
+        }
+        registrationTracker.set(ip, next);
+        if (next.lockUntilMs) {
+            const retryAfterSec = Math.max(1, Math.ceil((next.lockUntilMs - now) / 1000));
+            res.setHeader("Retry-After", String(retryAfterSec));
+            return res.status(429).json({ error: `Çok fazla kayıt denemesi. Lütfen ${retryAfterSec} saniye sonra tekrar deneyin.` });
+        }
+    }
     const passwordHash = await bcrypt_1.default.hash(password, 10);
     const user = await User_1.User.create({ email, passwordHash, name, role: role || "user", available_balance: 0, reserved_balance: 0 });
     const token = signAccess({ sub: String(user._id), role: user.role });
     const refresh = signRefresh({ sub: String(user._id) });
     return res.status(201).json({ token, refreshToken: refresh, user: { id: user._id, email: user.email, name: user.name, role: user.role, available_balance: user.available_balance, reserved_balance: user.reserved_balance } });
 });
-const loginSchema = zod_1.z.object({ email: zod_1.z.string().email(), password: zod_1.z.string().min(1) });
+const loginSchema = zod_1.z.object({
+    email: security_1.commonSchemas.email,
+    password: zod_1.z.string().min(1).max(128) // Basic validation for login
+});
 router.post("/login", async (req, res) => {
+    const ip = getClientIp(req);
+    const tracker = failedLoginTracker.get(ip);
+    const now = Date.now();
+    // If IP is currently locked out, short-circuit
+    if (tracker?.lockUntilMs && tracker.lockUntilMs > now) {
+        const retryAfterSec = Math.max(1, Math.ceil((tracker.lockUntilMs - now) / 1000));
+        res.setHeader("Retry-After", String(retryAfterSec));
+        return res.status(429).json({ error: `Çok fazla hatalı giriş denemesi. Lütfen ${retryAfterSec} saniye sonra tekrar deneyin.` });
+    }
     const parsed = loginSchema.safeParse(req.body);
     if (!parsed.success)
         return res.status(400).json({ error: parsed.error.flatten() });
     const { email, password } = parsed.data;
     const user = await User_1.User.findOne({ email });
-    if (!user)
+    if (!user) {
+        // Count failed attempt
+        const prev = failedLoginTracker.get(ip);
+        if (!prev || now - prev.firstMs > FAILED_LOGIN_WINDOW_MS) {
+            failedLoginTracker.set(ip, { count: 1, firstMs: now });
+        }
+        else {
+            const nextCount = prev.count + 1;
+            const next = { count: nextCount, firstMs: prev.firstMs };
+            if (nextCount >= FAILED_LOGIN_MAX_ATTEMPTS) {
+                next.lockUntilMs = now + FAILED_LOGIN_WINDOW_MS;
+            }
+            failedLoginTracker.set(ip, next);
+            if (next.lockUntilMs) {
+                const retryAfterSec = Math.max(1, Math.ceil((next.lockUntilMs - now) / 1000));
+                res.setHeader("Retry-After", String(retryAfterSec));
+                return res.status(429).json({ error: `Çok fazla hatalı giriş denemesi. Lütfen ${retryAfterSec} saniye sonra tekrar deneyin.` });
+            }
+        }
         return res.status(401).json({ error: "Invalid credentials" });
+    }
     const ok = await bcrypt_1.default.compare(password, user.passwordHash);
-    if (!ok)
+    if (!ok) {
+        // Count failed attempt
+        const prev = failedLoginTracker.get(ip);
+        if (!prev || now - prev.firstMs > FAILED_LOGIN_WINDOW_MS) {
+            failedLoginTracker.set(ip, { count: 1, firstMs: now });
+        }
+        else {
+            const nextCount = prev.count + 1;
+            const next = { count: nextCount, firstMs: prev.firstMs };
+            if (nextCount >= FAILED_LOGIN_MAX_ATTEMPTS) {
+                next.lockUntilMs = now + FAILED_LOGIN_WINDOW_MS;
+            }
+            failedLoginTracker.set(ip, next);
+            if (next.lockUntilMs) {
+                const retryAfterSec = Math.max(1, Math.ceil((next.lockUntilMs - now) / 1000));
+                res.setHeader("Retry-After", String(retryAfterSec));
+                return res.status(429).json({ error: `Çok fazla hatalı giriş denemesi. Lütfen ${retryAfterSec} saniye sonra tekrar deneyin.` });
+            }
+        }
         return res.status(401).json({ error: "Invalid credentials" });
+    }
+    // Successful login clears counters
+    if (tracker)
+        failedLoginTracker.delete(ip);
     const token = signAccess({ sub: String(user._id), role: user.role });
     const refresh = signRefresh({ sub: String(user._id) });
     return res.json({ token, refreshToken: refresh, user: { id: user._id, email: user.email, name: user.name, role: user.role, available_balance: user.available_balance, reserved_balance: user.reserved_balance } });
@@ -121,10 +222,25 @@ router.put("/me", auth_1.requireAuth, async (req, res) => {
     const user = await User_1.User.findByIdAndUpdate(userId, updates, { new: true }).select("email name role createdAt available_balance reserved_balance iban fullName paymentDescription");
     return res.json({ user });
 });
-router.get("/admin/users", auth_1.requireAdmin, async (_req, res) => {
-    const ids = await User_1.User.find().select("_id").sort({ createdAt: -1 }).limit(200);
+router.get("/admin/users", auth_1.requireAdmin, async (req, res) => {
+    // Pagination parameters
+    const page = Math.max(1, parseInt(String(req.query.page || 1)));
+    const limit = Math.min(100, Math.max(10, parseInt(String(req.query.limit || 20))));
+    const skip = (page - 1) * limit;
+    const totalUsers = await User_1.User.countDocuments();
+    const ids = await User_1.User.find().select("_id").sort({ createdAt: -1 }).skip(skip).limit(limit);
     const views = await Promise.all(ids.map((u) => walletView(String(u._id))));
-    return res.json({ users: views });
+    return res.json({
+        users: views,
+        pagination: {
+            page,
+            limit,
+            total: totalUsers,
+            totalPages: Math.ceil(totalUsers / limit),
+            hasNext: page < Math.ceil(totalUsers / limit),
+            hasPrev: page > 1,
+        }
+    });
 });
 // Admin: set user balance
 const balanceSchema = zod_1.z.object({ userId: zod_1.z.string().min(1), amount: zod_1.z.number() });
