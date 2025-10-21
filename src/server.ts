@@ -99,7 +99,10 @@ app.use("/api/admin/bans", adminBansRoutes);
 
 async function start() {
   const mongoUri = process.env.MONGODB_URI ?? "mongodb://127.0.0.1:27017/shortlink";
-  await mongoose.connect(mongoUri);
+  await mongoose.connect(mongoUri, {
+    dbName: "shortlink" // Database ismini sabitle
+  });
+  console.log("MongoDB connected:", mongoUri);
   const port = Number(process.env.PORT ?? 5050);
   app.listen(port, () => console.log(`API listening on http://localhost:${port}`));
 }
