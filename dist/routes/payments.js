@@ -16,7 +16,8 @@ const createSchema = zod_1.z.object({
     category: zod_1.z.enum(["payment", "withdrawal"]).optional(),
     audience: zod_1.z.enum(["user", "advertiser"]).optional(),
     iban: zod_1.z.string().optional(),
-    fullName: zod_1.z.string().optional()
+    fullName: zod_1.z.string().optional(),
+    withdrawalType: zod_1.z.enum(["earned", "referral"]).optional()
 });
 const statusSchema = zod_1.z.object({ status: zod_1.z.enum(["pending", "paid", "failed", "refunded", "approved", "rejected"]) });
 // List my payments (advertiser)
@@ -39,17 +40,38 @@ router.post("/", auth_1.requireAuth, async (req, res, next) => {
         const ownerId = req.user.sub;
         // Kullanıcı çekim isteği için özel kontrol
         if (parsed.data.category === "withdrawal" && parsed.data.audience === "user") {
-            const user = await User_1.User.findById(ownerId);
-            if (!user)
-                return res.status(404).json({ error: "User not found" });
+            // Atomic cooldown: 10 saniyede 1 defa (user.lastWithdrawalAt ile guard)
+            const now = new Date();
+            const cooldownMs = 10000;
+            const cooldownAgo = new Date(now.getTime() - cooldownMs);
+            const user = await User_1.User.findOneAndUpdate({
+                _id: ownerId,
+                $or: [
+                    { lastWithdrawalAt: { $exists: false } },
+                    { lastWithdrawalAt: { $lte: cooldownAgo } }
+                ]
+            }, { $set: { lastWithdrawalAt: now } }, { new: true });
+            if (!user) {
+                return res.status(429).json({ error: "Lütfen yeni çekim isteği göndermeden önce 10 saniye bekleyin" });
+            }
             // Minimum çekim kontrolü (50 TL)
             if (parsed.data.amount < 50) {
                 return res.status(400).json({ error: "Minimum çekim tutarı 50 TL'dir" });
             }
-            // Yeterli bakiye kontrolü (rezerve edilmemiş kısım)
-            const availableEarnedBalance = (user.earned_balance || 0) - (user.reserved_earned_balance || 0);
-            if (availableEarnedBalance < parsed.data.amount) {
-                return res.status(400).json({ error: "Yetersiz kazanç bakiyesi" });
+            // Çekim türüne göre bakiye kontrolü
+            const withdrawalType = parsed.data.withdrawalType || "earned";
+            let availableBalance = 0;
+            let balanceType = "";
+            if (withdrawalType === "earned") {
+                availableBalance = (user.earned_balance || 0) - (user.reserved_earned_balance || 0);
+                balanceType = "kazanç";
+            }
+            else if (withdrawalType === "referral") {
+                availableBalance = (user.referral_earned || 0) - (user.reserved_referral_earned || 0);
+                balanceType = "referans kazancı";
+            }
+            if (availableBalance < parsed.data.amount) {
+                return res.status(400).json({ error: `Yetersiz ${balanceType} bakiyesi` });
             }
             // IBAN kontrolü
             if (!parsed.data.iban || !parsed.data.fullName) {
@@ -64,9 +86,17 @@ router.post("/", auth_1.requireAuth, async (req, res, next) => {
         }
         // Kullanıcı çekim isteği için rezerve et
         if (doc.category === "withdrawal" && doc.audience === "user") {
-            await User_1.User.findByIdAndUpdate(ownerId, {
-                $inc: { reserved_earned_balance: doc.amount }
-            });
+            const withdrawalType = parsed.data.withdrawalType || "earned";
+            if (withdrawalType === "earned") {
+                await User_1.User.findByIdAndUpdate(ownerId, {
+                    $inc: { reserved_earned_balance: doc.amount }
+                });
+            }
+            else if (withdrawalType === "referral") {
+                await User_1.User.findByIdAndUpdate(ownerId, {
+                    $inc: { reserved_referral_earned: doc.amount }
+                });
+            }
         }
         return res.status(201).json({ payment: doc });
     }
@@ -75,37 +105,10 @@ router.post("/", auth_1.requireAuth, async (req, res, next) => {
     }
 });
 // Admin: list all payments
-router.get("/admin/all", auth_1.requireAdmin, async (req, res, next) => {
+router.get("/admin/all", auth_1.requireAdmin, async (_req, res, next) => {
     try {
-        // Pagination parameters
-        const page = Math.max(1, parseInt(String(req.query.page || 1)));
-        const limit = Math.min(100, Math.max(10, parseInt(String(req.query.limit || 20))));
-        const skip = (page - 1) * limit;
-        // Filter parameters
-        const category = req.query.category;
-        const audience = req.query.audience;
-        // Build filter object
-        const filter = {};
-        if (category)
-            filter.category = category;
-        if (audience)
-            filter.audience = audience;
-        const totalPayments = await Payment_1.Payment.countDocuments(filter);
-        const items = await Payment_1.Payment.find(filter)
-            .sort({ createdAt: -1 })
-            .skip(skip)
-            .limit(limit);
-        return res.json({
-            payments: items,
-            pagination: {
-                page,
-                limit,
-                total: totalPayments,
-                totalPages: Math.ceil(totalPayments / limit),
-                hasNext: page < Math.ceil(totalPayments / limit),
-                hasPrev: page > 1,
-            }
-        });
+        const items = await Payment_1.Payment.find().sort({ createdAt: -1 }).limit(500);
+        return res.json({ payments: items });
     }
     catch (e) {
         next(e);
@@ -122,19 +125,43 @@ router.put("/:id/status", auth_1.requireAdmin, async (req, res, next) => {
             return res.status(404).json({ error: "Payment not found" });
         // Kullanıcı çekim onayı için özel işlem
         if (payment.category === "withdrawal" && payment.audience === "user" && parsed.data.status === "approved") {
-            // Rezerve edilen parayı kazanç bakiyesinden düş
-            await User_1.User.findByIdAndUpdate(payment.ownerId, {
-                $inc: {
-                    earned_balance: -payment.amount,
-                    reserved_earned_balance: -payment.amount
-                }
-            });
+            const withdrawalType = payment.withdrawalType || "earned";
+            if (withdrawalType === "earned") {
+                // Normal kazanç çekimi - earned_balance ve reserved_earned_balance'dan düş
+                await User_1.User.findByIdAndUpdate(payment.ownerId, {
+                    $inc: {
+                        earned_balance: -payment.amount,
+                        reserved_earned_balance: -payment.amount,
+                        available_balance: -payment.amount
+                    }
+                });
+            }
+            else if (withdrawalType === "referral") {
+                // Referans kazancı çekimi - referral_earned ve reserved_referral_earned'dan düş
+                await User_1.User.findByIdAndUpdate(payment.ownerId, {
+                    $inc: {
+                        referral_earned: -payment.amount,
+                        reserved_referral_earned: -payment.amount,
+                        available_balance: -payment.amount
+                    }
+                });
+            }
         }
         // Reddedilen çekim için rezerve edilen parayı geri ver
         if (payment.category === "withdrawal" && payment.audience === "user" && parsed.data.status === "rejected") {
-            await User_1.User.findByIdAndUpdate(payment.ownerId, {
-                $inc: { reserved_earned_balance: -payment.amount }
-            });
+            const withdrawalType = payment.withdrawalType || "earned";
+            if (withdrawalType === "earned") {
+                // Normal kazanç çekimi reddi - reserved_earned_balance'dan düş
+                await User_1.User.findByIdAndUpdate(payment.ownerId, {
+                    $inc: { reserved_earned_balance: -payment.amount }
+                });
+            }
+            else if (withdrawalType === "referral") {
+                // Referans kazancı çekimi reddi - reserved_referral_earned'dan düş
+                await User_1.User.findByIdAndUpdate(payment.ownerId, {
+                    $inc: { reserved_referral_earned: -payment.amount }
+                });
+            }
         }
         const updated = await Payment_1.Payment.findByIdAndUpdate(req.params.id, { status: parsed.data.status }, { new: true });
         return res.json({ payment: updated });
@@ -146,37 +173,15 @@ router.put("/:id/status", auth_1.requireAdmin, async (req, res, next) => {
 // Admin: get user withdrawal requests
 router.get("/admin/withdrawals", auth_1.requireAdmin, async (req, res, next) => {
     try {
-        // Pagination parameters
-        const page = Math.max(1, parseInt(String(req.query.page || 1)));
-        const limit = Math.min(100, Math.max(5, parseInt(String(req.query.limit || 10))));
-        const skip = (page - 1) * limit;
-        // Filter parameters
-        const status = req.query.status;
-        // Build filter object
-        const filter = {
+        const items = await Payment_1.Payment.find({
             category: "withdrawal",
             audience: "user",
             status: { $in: ["pending", "approved", "rejected"] }
-        };
-        if (status)
-            filter.status = status;
-        const totalWithdrawals = await Payment_1.Payment.countDocuments(filter);
-        const items = await Payment_1.Payment.find(filter)
+        })
             .populate("ownerId", "email name fullName iban")
             .sort({ createdAt: -1 })
-            .skip(skip)
-            .limit(limit);
-        return res.json({
-            payments: items,
-            pagination: {
-                page,
-                limit,
-                total: totalWithdrawals,
-                totalPages: Math.ceil(totalWithdrawals / limit),
-                hasNext: page < Math.ceil(totalWithdrawals / limit),
-                hasPrev: page > 1,
-            }
-        });
+            .limit(100);
+        return res.json({ payments: items });
     }
     catch (e) {
         next(e);

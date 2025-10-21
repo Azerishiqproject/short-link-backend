@@ -47,8 +47,12 @@ const auth_1 = require("../middleware/auth");
 const geoService_1 = require("../services/geoService");
 const linkToken_1 = require("../utils/linkToken");
 const security_1 = require("../middleware/security");
+const referralService_1 = require("../services/referralService");
 const router = (0, express_1.Router)();
 let pricingCache = null;
+// IP earnings cache - IP -> { lastEarningTime, earnings }
+const ipEarningsCache = new Map();
+const IP_CACHE_TTL = 60 * 60 * 1000; // 1 saat
 async function loadPricingCache() {
     // Cache for 60 seconds to limit DB reads under traffic
     const needsRefresh = !pricingCache || (Date.now() - pricingCache.updatedAt) > 60000;
@@ -73,8 +77,75 @@ async function getPerClickRate(countryCode) {
     if (!countryCode)
         return fallback;
     const cache = await loadPricingCache();
-    return cache.countryToRate[countryCode.toUpperCase()] ?? fallback;
+    // Önce belirli ülke kodunu ara
+    let rate = cache.countryToRate[countryCode.toUpperCase()];
+    // Eğer bulunamazsa DF (default) ülke kodunu ara
+    if (rate === undefined) {
+        rate = cache.countryToRate['DF'];
+    }
+    // Eğer DF de yoksa environment variable'ı kullan
+    return rate ?? fallback;
 }
+// Duplicate click kontrolü - aynı IP'den 1 saat içinde aynı linke tıklama var mı?
+async function isDuplicateClick(linkId, ip) {
+    const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000);
+    const existingClick = await Link_1.Click.findOne({
+        linkId: linkId,
+        ip: ip,
+        clickedAt: { $gte: oneHourAgo }
+    });
+    return !!existingClick;
+}
+// IP bazlı global kazanç kontrolü - cache'li versiyon
+async function hasIPEarnedRecently(ip) {
+    const now = Date.now();
+    // Cache'den kontrol et
+    const cached = ipEarningsCache.get(ip);
+    if (cached) {
+        const timeDiff = now - cached.lastEarningTime;
+        if (timeDiff < IP_CACHE_TTL) {
+            return true; // 1 saat içinde para kazanmış
+        }
+        else {
+            // Cache expired, temizle
+            ipEarningsCache.delete(ip);
+        }
+    }
+    // Cache'de yoksa database'den kontrol et
+    const oneHourAgo = new Date(now - IP_CACHE_TTL);
+    const recentEarning = await Link_1.Click.findOne({
+        ip: ip,
+        clickedAt: { $gte: oneHourAgo },
+        earnings: { $gt: 0 }
+    });
+    if (recentEarning) {
+        // Cache'e ekle
+        ipEarningsCache.set(ip, {
+            lastEarningTime: recentEarning.clickedAt.getTime(),
+            earnings: recentEarning.earnings
+        });
+        return true;
+    }
+    return false;
+}
+// IP'ye para kazandırıldığında cache'i güncelle
+function updateIPEarningsCache(ip, earnings) {
+    ipEarningsCache.set(ip, {
+        lastEarningTime: Date.now(),
+        earnings: earnings
+    });
+}
+// Cache temizleme - expired entry'leri temizle
+function cleanupIPEarningsCache() {
+    const now = Date.now();
+    for (const [ip, data] of ipEarningsCache.entries()) {
+        if (now - data.lastEarningTime > IP_CACHE_TTL) {
+            ipEarningsCache.delete(ip);
+        }
+    }
+}
+// Her 5 dakikada bir cache temizleme
+setInterval(cleanupIPEarningsCache, 5 * 60 * 1000);
 // Per-user rate limiter: max 10 requests per minute
 const perUserLimiter = (0, express_rate_limit_1.default)({
     windowMs: 60 * 1000,
@@ -88,6 +159,10 @@ const createSchema = zod_1.z.object({
     targetUrl: zod_1.z.string().url().refine((u) => urlRegex.test(u), "Must be http/https"),
     customSlug: zod_1.z.string().min(3).max(32).regex(/^[a-zA-Z0-9_-]+$/).optional(),
     expiresAt: zod_1.z.string().datetime().optional(),
+});
+// Bulk create schema
+const bulkCreateSchema = zod_1.z.object({
+    urls: zod_1.z.array(zod_1.z.string().url().refine((u) => urlRegex.test(u), "Must be http/https")).min(1).max(100)
 });
 function generateSlug(length = 6) {
     const alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
@@ -123,6 +198,44 @@ router.post("/", auth_1.requireAuth, async (req, res) => {
     const link = await Link_1.Link.create({ slug, targetUrl, ownerId, expiresAt });
     return res.status(201).json({ id: link._id, slug: link.slug, shortUrl: `/r/${link.slug}`, targetUrl: link.targetUrl });
 });
+// Bulk create links
+router.post("/bulk", auth_1.requireAuth, perUserLimiter, async (req, res) => {
+    try {
+        // Allow both { urls: string[] } and { text: string }
+        let payload = req.body || {};
+        if (!payload.urls && typeof payload.text === 'string') {
+            const parts = String(payload.text)
+                .split(/[\n,]+/)
+                .map((s) => s.trim())
+                .filter(Boolean);
+            payload = { urls: parts };
+        }
+        const parsed = bulkCreateSchema.safeParse(payload);
+        if (!parsed.success)
+            return res.status(400).json({ error: parsed.error.flatten() });
+        const { urls } = parsed.data;
+        const ownerId = req.user.sub;
+        async function allocateUniqueSlug() {
+            for (let i = 0; i < 8; i++) {
+                const candidate = generateSlug();
+                const exists = await Link_1.Link.findOne({ slug: candidate }).select('_id');
+                if (!exists)
+                    return candidate;
+            }
+            throw new Error('Failed to allocate slug');
+        }
+        const creations = urls.map(async (targetUrl) => {
+            const slug = await allocateUniqueSlug();
+            const link = await Link_1.Link.create({ slug, targetUrl, ownerId });
+            return { id: link._id, slug: link.slug, shortUrl: `/r/${link.slug}`, targetUrl: link.targetUrl };
+        });
+        const links = await Promise.all(creations);
+        return res.status(201).json({ links });
+    }
+    catch (e) {
+        return res.status(500).json({ error: e?.message || 'bulk-failed' });
+    }
+});
 router.get("/", auth_1.requireAuth, async (req, res) => {
     const ownerId = req.user.sub;
     const page = Math.max(1, parseInt(String(req.query.page || 1)));
@@ -144,6 +257,78 @@ router.get("/", auth_1.requireAuth, async (req, res) => {
             hasPrev: page > 1,
         },
     });
+});
+// Get all links (admin)
+router.get("/admin/all", auth_1.requireAdmin, async (req, res) => {
+    try {
+        const links = await Link_1.Link.find().populate('ownerId', 'email name').sort({ createdAt: -1 });
+        return res.json({ links });
+    }
+    catch (e) {
+        console.error("Admin links fetch error:", e);
+        return res.status(500).json({ error: "Internal server error" });
+    }
+});
+// Get user's links by user ID (admin)
+router.get("/admin/user/:userId", auth_1.requireAdmin, async (req, res) => {
+    try {
+        const { userId } = req.params;
+        const { page = 1, limit = 10 } = req.query;
+        const skip = (Number(page) - 1) * Number(limit);
+        const links = await Link_1.Link.find({ ownerId: userId })
+            .select("_id slug targetUrl clicks earnings disabled createdAt")
+            .sort({ createdAt: -1 })
+            .skip(skip)
+            .limit(Number(limit));
+        const total = await Link_1.Link.countDocuments({ ownerId: userId });
+        return res.json({
+            links,
+            pagination: {
+                page: Number(page),
+                limit: Number(limit),
+                total,
+                totalPages: Math.ceil(total / Number(limit)),
+                hasNext: skip + Number(limit) < total,
+                hasPrev: Number(page) > 1
+            }
+        });
+    }
+    catch (e) {
+        console.error("Admin user links fetch error:", e);
+        return res.status(500).json({ error: "Internal server error" });
+    }
+});
+// Get link clicks by link ID (admin)
+router.get("/:linkId/clicks", auth_1.requireAdmin, async (req, res) => {
+    try {
+        const { linkId } = req.params;
+        const { page = 1, limit = 10 } = req.query;
+        const skip = (Number(page) - 1) * Number(limit);
+        const link = await Link_1.Link.findById(linkId);
+        if (!link) {
+            return res.status(404).json({ error: "Link not found" });
+        }
+        // Link'in click detaylarını al
+        const clicks = link.clicks || [];
+        const totalClicks = clicks.length;
+        const paginatedClicks = clicks.slice(skip, skip + Number(limit));
+        return res.json({
+            clicks: paginatedClicks,
+            total: totalClicks,
+            pagination: {
+                page: Number(page),
+                limit: Number(limit),
+                total: totalClicks,
+                totalPages: Math.ceil(totalClicks / Number(limit)),
+                hasNext: skip + Number(limit) < totalClicks,
+                hasPrev: Number(page) > 1
+            }
+        });
+    }
+    catch (e) {
+        console.error("Link clicks fetch error:", e);
+        return res.status(500).json({ error: "Internal server error" });
+    }
 });
 router.get("/stats", auth_1.requireAuth, perUserLimiter, async (req, res) => {
     const ownerId = req.user.sub;
@@ -212,24 +397,44 @@ router.get("/trend", auth_1.requireAuth, perUserLimiter, async (req, res) => {
         const linkIds = ids.map((d) => d._id);
         if (!linkIds.length)
             return res.json({ days, trend: [] });
-        const pipeline = [
-            { $match: { linkId: { $in: linkIds }, clickedAt: { $gte: since } } },
-            { $group: { _id: { $dateToString: { format: "%Y-%m-%d", date: "$clickedAt" } }, clicks: { $sum: 1 } } },
-            { $project: { _id: 0, date: "$_id", clicks: 1 } },
-            { $sort: { date: 1 } },
-        ];
-        const results = await Link_1.Click.aggregate(pipeline);
-        // Fill in missing days with 0 clicks
-        const trend = [];
-        for (let i = days - 1; i >= 0; i--) {
-            const date = new Date();
-            date.setDate(date.getDate() - i);
-            const dateStr = date.toISOString().split('T')[0];
-            const existingData = results.find(r => r.date === dateStr);
-            trend.push({
-                date: dateStr,
-                clicks: existingData ? existingData.clicks : 0
-            });
+        // If requesting last 24 hours, group by hour; otherwise group by day
+        let trend = [];
+        if (days === 1) {
+            const pipeline = [
+                { $match: { linkId: { $in: linkIds }, clickedAt: { $gte: since } } },
+                { $group: { _id: { $dateToString: { format: "%Y-%m-%dT%H:00:00Z", date: "$clickedAt" } }, clicks: { $sum: 1 } } },
+                { $project: { _id: 0, date: "$_id", clicks: 1 } },
+                { $sort: { date: 1 } },
+            ];
+            const results = await Link_1.Click.aggregate(pipeline);
+            // Fill missing hours (last 24 hours) using UTC-safe ISO format like YYYY-MM-DDTHH:00:00Z
+            for (let i = 23; i >= 0; i--) {
+                const dt = new Date(Date.now() - i * 60 * 60 * 1000);
+                dt.setUTCMinutes(0, 0, 0); // zero minutes/seconds/millis in UTC to avoid TZ shifts
+                const isoHour = dt.toISOString().slice(0, 13) + ":00:00Z"; // match group format (no milliseconds)
+                const existing = results.find((r) => r.date === isoHour);
+                trend.push({ date: isoHour, clicks: existing ? existing.clicks : 0 });
+            }
+        }
+        else {
+            const pipeline = [
+                { $match: { linkId: { $in: linkIds }, clickedAt: { $gte: since } } },
+                { $group: { _id: { $dateToString: { format: "%Y-%m-%d", date: "$clickedAt" } }, clicks: { $sum: 1 } } },
+                { $project: { _id: 0, date: "$_id", clicks: 1 } },
+                { $sort: { date: 1 } },
+            ];
+            const results = await Link_1.Click.aggregate(pipeline);
+            // Fill in missing days with 0 clicks
+            for (let i = days - 1; i >= 0; i--) {
+                const date = new Date();
+                date.setDate(date.getDate() - i);
+                const dateStr = date.toISOString().split('T')[0];
+                const existingData = results.find((r) => r.date === dateStr);
+                trend.push({
+                    date: dateStr,
+                    clicks: existingData ? existingData.clicks : 0,
+                });
+            }
         }
         const data = { days, trend };
         // Cache the result
@@ -320,7 +525,9 @@ router.get("/:id/stats", auth_1.requireAuth, async (req, res) => {
 });
 router.get("/:id/analytics", auth_1.requireAuth, async (req, res) => {
     const { id } = req.params;
-    const ownerId = req.user.sub;
+    const requester = req.user;
+    const ownerId = requester.sub;
+    const isAdmin = requester.role === "admin";
     // Pagination parameters
     const page = Math.max(1, parseInt(String(req.query.page || 1)));
     const limit = Math.min(100, Math.max(10, parseInt(String(req.query.limit || 10))));
@@ -328,18 +535,22 @@ router.get("/:id/analytics", auth_1.requireAuth, async (req, res) => {
     // Optional range filter (days)
     const daysParam = req.query.days ? Math.min(Math.max(parseInt(String(req.query.days)), 1), 365) : null;
     // Check cache first (include pagination and days in cache key)
-    const cacheKey = `analytics_${id}_${ownerId}_${page}_${limit}_${daysParam ?? 'all'}`;
+    const cacheKey = `analytics_${id}_${ownerId}_${page}_${limit}_${daysParam ?? 'all'}_${isAdmin ? 'admin' : 'user'}`;
     const cached = cache.get(cacheKey);
     if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
         return res.json(cached.data);
     }
-    const link = await Link_1.Link.findOne({ _id: id, ownerId });
+    const link = isAdmin ? await Link_1.Link.findById(id) : await Link_1.Link.findOne({ _id: id, ownerId });
     if (!link)
         return res.status(404).json({ error: "Not found" });
+    console.log("Analytics request for link:", id, "ownerId:", ownerId, "isAdmin:", isAdmin);
+    console.log("Link found:", !!link);
     // Build time filter if provided
     const sinceFilter = daysParam ? { clickedAt: { $gte: new Date(Date.now() - daysParam * 24 * 60 * 60 * 1000) } } : {};
     // Get total click count for pagination
     const totalClicks = await Link_1.Click.countDocuments({ linkId: id, ...sinceFilter });
+    console.log("Total clicks found:", totalClicks);
+    console.log("Since filter:", sinceFilter);
     // Get click analytics grouped by country (filtered by days if provided)
     const allClicks = await Link_1.Click.find({ linkId: id, ...sinceFilter }).sort({ clickedAt: -1 });
     // Get paginated recent clicks
@@ -372,29 +583,48 @@ router.get("/:id/analytics", auth_1.requireAuth, async (req, res) => {
         clicks: data.clicks,
     }))
         .sort((a, b) => b.count - a.count);
-    // Get daily trend for this specific link (range)
+    // Get trend for this specific link (range)
     const days = daysParam ?? 7;
     const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
     const mongoose = await Promise.resolve().then(() => __importStar(require('mongoose')));
     const linkObjectId = new mongoose.Types.ObjectId(id);
-    const pipeline = [
-        { $match: { linkId: linkObjectId, clickedAt: { $gte: since } } },
-        { $group: { _id: { $dateToString: { format: "%Y-%m-%d", date: "$clickedAt" } }, clicks: { $sum: 1 } } },
-        { $project: { _id: 0, date: "$_id", clicks: 1 } },
-        { $sort: { date: 1 } },
-    ];
-    const trendResults = await Link_1.Click.aggregate(pipeline);
-    // Fill in missing days with 0 clicks
-    const trend = [];
-    for (let i = 6; i >= 0; i--) {
-        const date = new Date();
-        date.setDate(date.getDate() - i);
-        const dateStr = date.toISOString().split('T')[0];
-        const existingData = trendResults.find(r => r.date === dateStr);
-        trend.push({
-            date: dateStr,
-            clicks: existingData ? existingData.clicks : 0
-        });
+    let trend = [];
+    if (days === 1) {
+        // Hourly grouping for last 24 hours
+        const pipeline = [
+            { $match: { linkId: linkObjectId, clickedAt: { $gte: since } } },
+            { $group: { _id: { $dateToString: { format: "%Y-%m-%dT%H:00:00Z", date: "$clickedAt" } }, clicks: { $sum: 1 } } },
+            { $project: { _id: 0, date: "$_id", clicks: 1 } },
+            { $sort: { date: 1 } },
+        ];
+        const results = await Link_1.Click.aggregate(pipeline);
+        for (let i = 23; i >= 0; i--) {
+            const dt = new Date(Date.now() - i * 60 * 60 * 1000);
+            dt.setUTCMinutes(0, 0, 0);
+            const isoHour = dt.toISOString().slice(0, 13) + ":00:00Z";
+            const existing = results.find((r) => r.date === isoHour);
+            trend.push({ date: isoHour, clicks: existing ? existing.clicks : 0 });
+        }
+    }
+    else {
+        // Daily grouping for last N days
+        const pipeline = [
+            { $match: { linkId: linkObjectId, clickedAt: { $gte: since } } },
+            { $group: { _id: { $dateToString: { format: "%Y-%m-%d", date: "$clickedAt" } }, clicks: { $sum: 1 } } },
+            { $project: { _id: 0, date: "$_id", clicks: 1 } },
+            { $sort: { date: 1 } },
+        ];
+        const results = await Link_1.Click.aggregate(pipeline);
+        for (let i = days - 1; i >= 0; i--) {
+            const date = new Date();
+            date.setDate(date.getDate() - i);
+            const dateStr = date.toISOString().split('T')[0];
+            const existingData = results.find((r) => r.date === dateStr);
+            trend.push({
+                date: dateStr,
+                clicks: existingData ? existingData.clicks : 0
+            });
+        }
     }
     const data = {
         linkId: id,
@@ -460,9 +690,13 @@ router.post('/:id/click', async (req, res) => {
     // Get client IP and country
     const clientIP = (0, geoService_1.getClientIP)(req);
     const country = (0, geoService_1.getCountryFromIP)(clientIP);
-    // Kullanıcıya kazanç ekle (her tıklama için)
-    const earningRate = await getPerClickRate(country);
-    // Log detailed click data with earnings
+    // Duplicate click kontrolü - aynı IP'den 1 saat içinde aynı linke tıklama var mı?
+    const isDuplicate = await isDuplicateClick(id, clientIP);
+    // IP bazlı global kazanç kontrolü - aynı IP'den 1 saat içinde herhangi bir linke para gitmiş mi?
+    const hasEarnedRecently = await hasIPEarnedRecently(clientIP);
+    // Kullanıcıya kazanç ekle (sadece ilk tıklama ve IP kısıtlaması yoksa)
+    const earningRate = (isDuplicate || hasEarnedRecently) ? 0 : await getPerClickRate(country);
+    // Log detailed click data with earnings (her zaman logla)
     await Link_1.Click.create({
         linkId: id,
         ip: clientIP,
@@ -471,17 +705,35 @@ router.post('/:id/click', async (req, res) => {
         referer: req.headers.referer,
         earnings: earningRate,
     });
-    // Update link click count and earnings
+    // Update link click count (her zaman artır) ve earnings (sadece ilk tıklama için)
     link.clicks += 1;
-    link.earnings = (link.earnings || 0) + earningRate;
+    if (!isDuplicate) {
+        link.earnings = (link.earnings || 0) + earningRate;
+    }
     link.lastClickedAt = new Date();
     await link.save();
-    await User_1.User.findByIdAndUpdate(link.ownerId, {
-        $inc: { earned_balance: earningRate }
-    });
+    // Kullanıcı bakiyesini güncelle (sadece ilk tıklama için)
+    if (!isDuplicate && !hasEarnedRecently) {
+        await User_1.User.findByIdAndUpdate(link.ownerId, {
+            $inc: { earned_balance: earningRate, available_balance: earningRate }
+        });
+        // Referans kazanç işlemini başlat (sadece ilk tıklama için)
+        referralService_1.referralService.processClickReferral(link.ownerId, String(link._id), earningRate).catch(error => {
+            console.error("Click referral processing error:", error);
+        });
+        // IP earnings cache'ini güncelle
+        if (earningRate > 0) {
+            updateIPEarningsCache(clientIP, earningRate);
+        }
+    }
     // Invalidate caches so stats/trend update immediately
     invalidateAnalyticsCacheForLink(String(link._id), String(link.ownerId));
-    return res.json({ ok: true });
+    return res.json({
+        ok: true,
+        duplicate: isDuplicate,
+        ipEarnedRecently: hasEarnedRecently,
+        earnings: earningRate
+    });
 });
 // =============================
 // Signed Token APIs
@@ -549,8 +801,12 @@ router.post('/impression', async (req, res) => {
             // Log click with real client IP (from impression request)
             if (link) {
                 const country = (0, geoService_1.getCountryFromIP)(ip);
-                // Kullanıcıya kazanç ekle (her tıklama için)
-                const earningRate = await getPerClickRate(country);
+                // Duplicate click kontrolü - aynı IP'den 1 saat içinde aynı linke tıklama var mı?
+                const isDuplicate = await isDuplicateClick(session.linkId, ip);
+                // IP bazlı global kazanç kontrolü - aynı IP'den 1 saat içinde herhangi bir linke para gitmiş mi?
+                const hasEarnedRecently = await hasIPEarnedRecently(ip);
+                // Kullanıcıya kazanç ekle (sadece ilk tıklama ve IP kısıtlaması yoksa)
+                const earningRate = (isDuplicate || hasEarnedRecently) ? 0 : await getPerClickRate(country);
                 await Link_1.Click.create({
                     linkId: session.linkId,
                     ip: ip,
@@ -559,18 +815,42 @@ router.post('/impression', async (req, res) => {
                     referer: req.headers.referer,
                     earnings: earningRate,
                 });
-                // Update link click count and earnings
+                // Update link click count (her zaman artır) ve earnings (sadece ilk tıklama için)
                 link.clicks = (link.clicks || 0) + 1;
-                link.earnings = (link.earnings || 0) + earningRate;
+                if (!isDuplicate) {
+                    link.earnings = (link.earnings || 0) + earningRate;
+                }
                 link.lastClickedAt = new Date();
                 await link.save();
-                await User_1.User.findByIdAndUpdate(link.ownerId, {
-                    $inc: { earned_balance: earningRate }
-                });
+                // Kullanıcı bakiyesini güncelle (sadece ilk tıklama için)
+                if (!isDuplicate && !hasEarnedRecently) {
+                    await User_1.User.findByIdAndUpdate(link.ownerId, {
+                        $inc: { earned_balance: earningRate, available_balance: earningRate }
+                    });
+                    // Referans kazanç işlemini başlat (sadece ilk tıklama için)
+                    referralService_1.referralService.processClickReferral(link.ownerId, String(link._id), earningRate).catch(error => {
+                        console.error("Click referral processing error:", error);
+                    });
+                    // IP earnings cache'ini güncelle
+                    if (earningRate > 0) {
+                        updateIPEarningsCache(ip, earningRate);
+                    }
+                }
                 // Invalidate caches so stats/trend update immediately
                 invalidateAnalyticsCacheForLink(String(link._id), String(link.ownerId));
             }
-            return res.json({ ok: true, done: true, redirect: link?.targetUrl || null, linkId: session.linkId, suspicious, ip, ua, metrics });
+            return res.json({
+                ok: true,
+                done: true,
+                redirect: link?.targetUrl || null,
+                linkId: session.linkId,
+                suspicious,
+                ip,
+                ua,
+                metrics,
+                duplicate: link ? await isDuplicateClick(session.linkId, ip) : false,
+                ipEarnedRecently: link ? await hasIPEarnedRecently(ip) : false
+            });
         }
         return res.json({ ok: true, done: false, suspicious, ip, ua, metrics, already });
     }

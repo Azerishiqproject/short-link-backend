@@ -15,6 +15,8 @@ const paymentSchema = new Schema(
     iban: { type: String, required: false, maxlength: 26 },
     fullName: { type: String, required: false, maxlength: 100 },
     adminNotes: { type: String, required: false, maxlength: 500 }, // Admin notları
+  // Çekim türü: normal kazanç vs referans kazancı
+  withdrawalType: { type: String, enum: ["earned", "referral"], required: false },
   },
   { timestamps: true }
 );

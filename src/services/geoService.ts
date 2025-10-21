@@ -69,7 +69,6 @@ export function getClientIP(req: any): string {
       'req.connection.remoteAddress': req.connection?.remoteAddress,
     };
     
-    console.log('IP Debug Info:', debugInfo);
   }
   
   // Öncelik sırasına göre IP kaynaklarını kontrol et
@@ -95,13 +94,11 @@ export function getClientIP(req: any): string {
   }
   
   if (isDebug) {
-    console.log('Selected IP source:', raw);
   }
   
   // IP bulunamadıysa fallback
   if (!raw) {
     if (isDebug) {
-      console.log('No IP found, using fallback 127.0.0.1');
     }
     return '127.0.0.1';
   }
@@ -109,7 +106,6 @@ export function getClientIP(req: any): string {
   // IPv6 localhost'u IPv4'e çevir
   if (raw === '::1') {
     if (isDebug) {
-      console.log('IPv6 localhost detected, converting to 127.0.0.1');
     }
     return '127.0.0.1';
   }
@@ -118,7 +114,6 @@ export function getClientIP(req: any): string {
   const cleanedIP = raw.replace(/^::ffff:/, '');
   
   if (isDebug) {
-    console.log('Final IP:', cleanedIP);
   }
   
   return cleanedIP;

@@ -11,12 +11,17 @@ import linkRoutes from "./routes/links";
 import campaignRoutes from "./routes/campaigns";
 import pricingRoutes from "./routes/pricing";
 import paymentRoutes from "./routes/payments";
-import { 
-  sanitizeInput, 
-  rateLimitDbOperations, 
-  logDbOperations, 
-  securityHeaders 
-} from "./middleware/security";
+import supportRoutes from "./routes/support";
+import blogRoutes from "./routes/blog";
+import adminBlogRoutes from "./routes/admin/blog";
+import adminPricingRoutes from "./routes/admin/pricing";
+import adminPaymentsRoutes from "./routes/admin/payments";
+import adminCampaignsRoutes from "./routes/admin/campaigns";
+import adminLinksRoutes from "./routes/admin/links";
+import adminSupportRoutes from "./routes/admin/support";
+import adminReferralsRoutes from "./routes/admin/referrals";
+import adminBansRoutes from "./routes/admin/bans";
+import { banGuard } from "./middleware/security";
 
 const app = express();
 // Respect X-Forwarded-* headers (for real client IP behind proxies)
@@ -39,14 +44,12 @@ function isAllowedOrigin(origin?: string): boolean {
 app.use(cors());
 app.options(/.*/, cors());
 app.use(helmet());
-app.use(securityHeaders);
-app.use(sanitizeInput);
-app.use(rateLimitDbOperations);
-app.use(logDbOperations);
-app.use(express.json({ limit: '10mb' })); // Limit JSON payload size
-app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+app.use(express.json());
 app.use(morgan("dev"));
-app.use(rateLimit({ windowMs: 15 * 60 * 1000, max: 200 }));
+// Ban check must be early
+app.use(banGuard);
+// Global rate limit, but skip chat/support endpoints
+app.use(rateLimit({ windowMs: 15 * 60 * 1000, max: 200, skip: (req) => req.path?.startsWith("/api/support") === true }));
 // Optional root response for uptime checks
 app.get("/", (_req, res) => res.send("Backend API is running"));
 
@@ -56,11 +59,20 @@ app.use("/api/links", linkRoutes);
 app.use("/api/campaigns", campaignRoutes);
 app.use("/api/pricing", pricingRoutes);
 app.use("/api/payments", paymentRoutes);
+app.use("/api/support", supportRoutes);
+app.use("/api/blog", blogRoutes);
+app.use("/api/admin/blog", adminBlogRoutes);
+app.use("/api/admin/pricing", adminPricingRoutes);
+app.use("/api/admin/payments", adminPaymentsRoutes);
+app.use("/api/admin/campaigns", adminCampaignsRoutes);
+app.use("/api/admin/links", adminLinksRoutes);
+app.use("/api/admin/support", adminSupportRoutes);
+app.use("/api/admin/referrals", adminReferralsRoutes);
+app.use("/api/admin/bans", adminBansRoutes);
 
 async function start() {
   const mongoUri = process.env.MONGODB_URI ?? "mongodb://127.0.0.1:27017/shortlink";
   await mongoose.connect(mongoUri);
-  console.log("MongoDB connected:", mongoUri);
   const port = Number(process.env.PORT ?? 5050);
   app.listen(port, () => console.log(`API listening on http://localhost:${port}`));
 }

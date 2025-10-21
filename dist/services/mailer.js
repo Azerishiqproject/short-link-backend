@@ -34,7 +34,6 @@ async function verifySmtp() {
         await t.verify();
         if (process.env.EMAIL_DEBUG === "1") {
             // Log only in debug
-            console.log("SMTP verify: OK (", process.env.SMTP_HOST, ")");
         }
     }
     catch (err) {
@@ -45,7 +44,6 @@ async function sendMail({ to, subject, html }) {
     const from = process.env.MAIL_FROM || process.env.SMTP_USER || "no-reply@example.com";
     const t = getTransporter();
     if (process.env.EMAIL_DEBUG === "1") {
-        console.log("Sending mail:", { from, to, subject });
     }
     await t.sendMail({ from, to, subject, html });
 }

@@ -16,6 +16,16 @@ const links_1 = __importDefault(require("./routes/links"));
 const campaigns_1 = __importDefault(require("./routes/campaigns"));
 const pricing_1 = __importDefault(require("./routes/pricing"));
 const payments_1 = __importDefault(require("./routes/payments"));
+const support_1 = __importDefault(require("./routes/support"));
+const blog_1 = __importDefault(require("./routes/blog"));
+const blog_2 = __importDefault(require("./routes/admin/blog"));
+const pricing_2 = __importDefault(require("./routes/admin/pricing"));
+const payments_2 = __importDefault(require("./routes/admin/payments"));
+const campaigns_2 = __importDefault(require("./routes/admin/campaigns"));
+const links_2 = __importDefault(require("./routes/admin/links"));
+const support_2 = __importDefault(require("./routes/admin/support"));
+const referrals_1 = __importDefault(require("./routes/admin/referrals"));
+const bans_1 = __importDefault(require("./routes/admin/bans"));
 const security_1 = require("./middleware/security");
 const app = (0, express_1.default)();
 // Respect X-Forwarded-* headers (for real client IP behind proxies)
@@ -39,14 +49,12 @@ function isAllowedOrigin(origin) {
 app.use((0, cors_1.default)());
 app.options(/.*/, (0, cors_1.default)());
 app.use((0, helmet_1.default)());
-app.use(security_1.securityHeaders);
-app.use(security_1.sanitizeInput);
-app.use(security_1.rateLimitDbOperations);
-app.use(security_1.logDbOperations);
-app.use(express_1.default.json({ limit: '10mb' })); // Limit JSON payload size
-app.use(express_1.default.urlencoded({ extended: true, limit: '10mb' }));
+app.use(express_1.default.json());
 app.use((0, morgan_1.default)("dev"));
-app.use((0, express_rate_limit_1.default)({ windowMs: 15 * 60 * 1000, max: 200 }));
+// Ban check must be early
+app.use(security_1.banGuard);
+// Global rate limit, but skip chat/support endpoints
+app.use((0, express_rate_limit_1.default)({ windowMs: 15 * 60 * 1000, max: 200, skip: (req) => req.path?.startsWith("/api/support") === true }));
 // Optional root response for uptime checks
 app.get("/", (_req, res) => res.send("Backend API is running"));
 app.get("/api/health", (_req, res) => res.json({ ok: true }));
@@ -55,6 +63,16 @@ app.use("/api/links", links_1.default);
 app.use("/api/campaigns", campaigns_1.default);
 app.use("/api/pricing", pricing_1.default);
 app.use("/api/payments", payments_1.default);
+app.use("/api/support", support_1.default);
+app.use("/api/blog", blog_1.default);
+app.use("/api/admin/blog", blog_2.default);
+app.use("/api/admin/pricing", pricing_2.default);
+app.use("/api/admin/payments", payments_2.default);
+app.use("/api/admin/campaigns", campaigns_2.default);
+app.use("/api/admin/links", links_2.default);
+app.use("/api/admin/support", support_2.default);
+app.use("/api/admin/referrals", referrals_1.default);
+app.use("/api/admin/bans", bans_1.default);
 async function start() {
     const mongoUri = process.env.MONGODB_URI ?? "mongodb://127.0.0.1:27017/shortlink";
     await mongoose_1.default.connect(mongoUri);

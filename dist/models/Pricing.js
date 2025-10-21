@@ -40,10 +40,7 @@ const priceEntrySchema = new mongoose_1.Schema({
     country: { type: String, required: true },
     unit: { type: String, enum: ["per_1000"], default: "per_1000" },
     rates: {
-        google_review: { type: Number, required: true, min: 0 },
         website_traffic: { type: Number, required: true, min: 0 },
-        video_views: { type: Number, required: true, min: 0 },
-        like_follow: { type: Number, required: true, min: 0 },
     },
 }, { _id: false });
 const pricingSchema = new mongoose_1.Schema({

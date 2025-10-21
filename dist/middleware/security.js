@@ -1,7 +1,9 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.securityHeaders = exports.mongoSanitize = exports.logDbOperations = exports.commonSchemas = exports.rateLimitDbOperations = exports.sanitizeInput = void 0;
+exports.banGuard = banGuard;
 const zod_1 = require("zod");
+const Ban_1 = require("../models/Ban");
 // Input sanitization and validation middleware
 const sanitizeInput = (req, res, next) => {
     // Sanitize string inputs to prevent XSS and injection attacks
@@ -36,9 +38,11 @@ const sanitizeInput = (req, res, next) => {
         }
         return obj;
     };
-    // Sanitize request body and params (query is read-only)
+    // Sanitize request body, query, and params
     if (req.body)
         req.body = sanitizeObject(req.body);
+    if (req.query)
+        req.query = sanitizeObject(req.query);
     if (req.params)
         req.params = sanitizeObject(req.params);
     next();
@@ -67,6 +71,50 @@ const rateLimitDbOperations = (req, res, next) => {
     next();
 };
 exports.rateLimitDbOperations = rateLimitDbOperations;
+async function banGuard(req, res, next) {
+    try {
+        const now = new Date();
+        const ip = getClientIp(req);
+        const macHeader = req.headers["x-device-mac"];
+        const mac = typeof macHeader === "string" ? macHeader.trim() : Array.isArray(macHeader) ? macHeader[0]?.trim() : undefined;
+        const deviceIdHeader = req.headers["x-device-id"];
+        const deviceId = typeof deviceIdHeader === "string" ? deviceIdHeader.trim() : Array.isArray(deviceIdHeader) ? deviceIdHeader[0]?.trim() : undefined;
+        const baseExpiry = { $or: [{ expiresAt: { $exists: false } }, { expiresAt: null }, { expiresAt: { $gt: now } }] };
+        const orConds = [];
+        if (ip)
+            orConds.push({ ip, active: true, ...baseExpiry });
+        if (mac)
+            orConds.push({ mac, active: true, ...baseExpiry });
+        if (deviceId)
+            orConds.push({ mac: deviceId, active: true, ...baseExpiry });
+        const userId = req?.user?.sub;
+        if (userId)
+            orConds.push({ userId, active: true, ...baseExpiry });
+        // Check for email ban if user is authenticated
+        if (userId) {
+            try {
+                const User = require('../models/User').User;
+                const user = await User.findById(userId).select('email').lean();
+                if (user?.email) {
+                    orConds.push({ email: user.email, active: true, ...baseExpiry });
+                }
+            }
+            catch (e) {
+                // Ignore email check errors
+            }
+        }
+        if (orConds.length === 0)
+            return next();
+        const banned = await Ban_1.Ban.findOne({ $or: orConds }).lean();
+        if (banned) {
+            return res.status(403).json({ error: "Erişim engellendi" });
+        }
+        next();
+    }
+    catch (e) {
+        return res.status(500).json({ error: "Ban kontrolü başarısız" });
+    }
+}
 // Enhanced input validation schemas
 exports.commonSchemas = {
     // ObjectId validation

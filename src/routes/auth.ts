@@ -2,11 +2,14 @@ import { Router } from "express";
 import { z } from "zod";
 import bcrypt from "bcrypt";
 import jwt from "jsonwebtoken";
+import mongoose from "mongoose";
 import { User } from "../models/User";
 import { Campaign } from "../models/Campaign";
 import { requireAuth, requireAdmin } from "../middleware/auth";
 import { sendMail, verifySmtp } from "../services/mailer";
 import { commonSchemas, mongoSanitize } from "../middleware/security";
+import { generateUniqueReferralCode, validateReferralCode } from "../utils/referralCode";
+import { referralService } from "../services/referralService";
 
 const router = Router();
 
@@ -48,7 +51,7 @@ async function walletView(userId: string) {
   }
   
   const sanitizedUserId = mongoSanitize.sanitizeQuery({ _id: userId });
-  const user = await User.findById(sanitizedUserId._id).select("email name role createdAt available_balance reserved_balance earned_balance reserved_earned_balance iban fullName paymentDescription").lean();
+  const user = await User.findById(sanitizedUserId._id).select("email name role createdAt available_balance reserved_balance earned_balance reserved_earned_balance referral_earned reserved_referral_earned iban fullName paymentDescription referralCode referralCount referredBy").lean();
   if (!user) return null;
   
   const sanitizedOwnerQuery = mongoSanitize.sanitizeQuery({ ownerId: userId });
@@ -64,11 +67,14 @@ const registerSchema = z.object({
   email: commonSchemas.email,
   password: commonSchemas.password,
   name: commonSchemas.text.min(2).max(50).optional(),
-  role: z.enum(["user", "advertiser"]).optional(),
+  // role: z.enum(["user", "advertiser"]).optional(), // Reklam veren rolü geçici olarak devre dışı
+  referralCode: z.string().length(6).optional(), // 6 karakterli referans kodu (opsiyonel)
 });
 
 router.post("/register", async (req, res) => {
   const ip = getClientIp(req);
+  const deviceIdHeader = req.headers["x-device-id"];
+  const deviceId = typeof deviceIdHeader === "string" ? deviceIdHeader.trim() : Array.isArray(deviceIdHeader) ? deviceIdHeader[0]?.trim() : undefined;
   const tracker = registrationTracker.get(ip);
   const now = Date.now();
   
@@ -81,9 +87,38 @@ router.post("/register", async (req, res) => {
 
   const parsed = registerSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
-  const { email, password, name, role } = parsed.data;
+  const { email, password, name, referralCode } = parsed.data; // role kaldırıldı
+
+  // Check for bans before registration
+  try {
+    const Ban = require('../models/Ban').Ban;
+    const banNow = new Date();
+    const baseExpiry = { $or: [{ expiresAt: { $exists: false } }, { expiresAt: null }, { expiresAt: { $gt: banNow } }] };
+    
+    const banConds: any[] = [];
+    if (ip) banConds.push({ ip, active: true, ...baseExpiry });
+    if (deviceId) banConds.push({ mac: deviceId, active: true, ...baseExpiry });
+    banConds.push({ email, active: true, ...baseExpiry });
+    
+    const banned = await Ban.findOne({ $or: banConds }).lean();
+    if (banned) {
+      return res.status(403).json({ error: "Erişim engellendi" });
+    }
+  } catch (e) {
+    // Continue if ban check fails
+  }
   const exists = await User.findOne({ email });
   if (exists) return res.status(409).json({ error: "Email already in use" });
+  
+  // Referans kodu kontrolü
+  let referrer = null;
+  if (referralCode) {
+    const referralValidation = await validateReferralCode(referralCode);
+    if (!referralValidation.isValid) {
+      return res.status(400).json({ error: "Geçersiz referans kodu" });
+    }
+    referrer = referralValidation.referrer;
+  }
   
   // Count registration attempt
   const prev = registrationTracker.get(ip);
@@ -104,10 +139,51 @@ router.post("/register", async (req, res) => {
   }
   
   const passwordHash = await bcrypt.hash(password, 10);
-  const user = await User.create({ email, passwordHash, name, role: role || "user", available_balance: 0, reserved_balance: 0 });
+  
+  // Benzersiz referans kodu oluştur
+  const userReferralCode = await generateUniqueReferralCode();
+  
+  // Kullanıcı oluştur - Reklam veren rolü geçici olarak devre dışı
+  const user = await User.create({ 
+    email, 
+    passwordHash, 
+    name, 
+    role: "user", // role || "user" yerine sadece "user" - reklam veren kaldırıldı
+    available_balance: 0, 
+    reserved_balance: 0,
+    referralCode: userReferralCode,
+    referredBy: referrer ? referrer._id : undefined,
+    registrationIp: ip,
+    registrationDeviceId: deviceId,
+  });
+  
+  // Referans eden kullanıcının referans sayısını artır
+  if (referrer) {
+    await User.findByIdAndUpdate(referrer._id, { 
+      $inc: { referralCount: 1 } 
+    });
+    
+    // Referans kazanç işlemini başlat (asenkron)
+    referralService.processRegistrationReferral(user._id.toString()).catch(error => {
+      console.error("Registration referral processing error:", error);
+    });
+  }
+  
   const token = signAccess({ sub: String(user._id), role: user.role });
   const refresh = signRefresh({ sub: String(user._id) });
-  return res.status(201).json({ token, refreshToken: refresh, user: { id: user._id, email: user.email, name: user.name, role: user.role, available_balance: user.available_balance, reserved_balance: user.reserved_balance } });
+  return res.status(201).json({ 
+    token, 
+    refreshToken: refresh, 
+    user: { 
+      id: user._id, 
+      email: user.email, 
+      name: user.name, 
+      role: user.role, 
+      available_balance: user.available_balance, 
+      reserved_balance: user.reserved_balance,
+      referralCode: user.referralCode
+    } 
+  });
 });
 
 const loginSchema = z.object({ 
@@ -117,6 +193,8 @@ const loginSchema = z.object({
 
 router.post("/login", async (req, res) => {
   const ip = getClientIp(req);
+  const deviceIdHeader = req.headers["x-device-id"];
+  const deviceId = typeof deviceIdHeader === "string" ? deviceIdHeader.trim() : Array.isArray(deviceIdHeader) ? deviceIdHeader[0]?.trim() : undefined;
   const tracker = failedLoginTracker.get(ip);
   const now = Date.now();
   // If IP is currently locked out, short-circuit
@@ -129,6 +207,25 @@ router.post("/login", async (req, res) => {
   const parsed = loginSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
   const { email, password } = parsed.data;
+
+  // Check for bans before login
+  try {
+    const Ban = require('../models/Ban').Ban;
+    const banNow = new Date();
+    const baseExpiry = { $or: [{ expiresAt: { $exists: false } }, { expiresAt: null }, { expiresAt: { $gt: banNow } }] };
+    
+    const banConds: any[] = [];
+    if (ip) banConds.push({ ip, active: true, ...baseExpiry });
+    if (deviceId) banConds.push({ mac: deviceId, active: true, ...baseExpiry });
+    banConds.push({ email, active: true, ...baseExpiry });
+    
+    const banned = await Ban.findOne({ $or: banConds }).lean();
+    if (banned) {
+      return res.status(403).json({ error: "Erişim engellendi" });
+    }
+  } catch (e) {
+    // Continue if ban check fails
+  }
   const user = await User.findOne({ email });
   if (!user) {
     // Count failed attempt
@@ -173,6 +270,16 @@ router.post("/login", async (req, res) => {
   }
   // Successful login clears counters
   if (tracker) failedLoginTracker.delete(ip);
+  // Update last IP and device history (best-effort)
+  try {
+    const updates: any = { lastLoginIp: ip };
+    if (deviceId && (!Array.isArray(user.deviceIds) || !user.deviceIds.includes(deviceId))) {
+      updates.$addToSet = { deviceIds: deviceId };
+    }
+    await User.findByIdAndUpdate(user._id, updates, { new: false });
+  } catch (e) {
+    // ignore telemetry errors
+  }
   const token = signAccess({ sub: String(user._id), role: user.role });
   const refresh = signRefresh({ sub: String(user._id) });
   return res.json({ token, refreshToken: refresh, user: { id: user._id, email: user.email, name: user.name, role: user.role, available_balance: user.available_balance, reserved_balance: user.reserved_balance } });
@@ -227,9 +334,81 @@ router.get("/admin/users", requireAdmin, async (req, res) => {
   const page = Math.max(1, parseInt(String(req.query.page || 1)));
   const limit = Math.min(100, Math.max(10, parseInt(String(req.query.limit || 20))));
   const skip = (page - 1) * limit;
+  const search = String(req.query.search || "").trim();
+  const role = String(req.query.role || "").trim();
 
-  const totalUsers = await User.countDocuments();
-  const ids = await User.find().select("_id").sort({ createdAt: -1 }).skip(skip).limit(limit);
+  // Build search query
+  let searchQuery: any = {};
+  
+  // Role filter
+  if (role && role !== "all") {
+    searchQuery.role = role;
+  }
+  
+  // Search filter
+  if (search) {
+    // Search by name, email, or _id (only if it's a valid ObjectId)
+    const searchRegex = new RegExp(search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+    const searchConditions: any[] = [
+      { name: searchRegex },
+      { email: searchRegex }
+    ];
+    
+    // Only add _id search if it looks like a valid ObjectId (24 hex characters)
+    if (/^[0-9a-fA-F]{24}$/.test(search)) {
+      searchConditions.push({ _id: search });
+    }
+    
+    // Combine role and search filters
+    if (Object.keys(searchQuery).length > 0) {
+      searchQuery = { $and: [searchQuery, { $or: searchConditions }] };
+    } else {
+      searchQuery = { $or: searchConditions };
+    }
+  }
+
+  // Get banned user IDs to exclude them
+  const Ban = require('../models/Ban').Ban;
+  const now = new Date();
+  const baseExpiry = { $or: [{ expiresAt: { $exists: false } }, { expiresAt: null }, { expiresAt: { $gt: now } }] };
+  
+  const bannedUsers = await Ban.find({ 
+    active: true, 
+    ...baseExpiry,
+    $or: [
+      { userId: { $exists: true } },
+      { email: { $exists: true } }
+    ]
+  }).select('userId email').lean();
+  
+  const bannedUserIds = bannedUsers
+    .map((b: any) => b.userId)
+    .filter((id: any) => id)
+    .map((id: any) => new mongoose.Types.ObjectId(id));
+  
+  const bannedEmails = bannedUsers
+    .map((b: any) => b.email)
+    .filter((email: any) => email);
+  
+  // Add ban exclusions to search query
+  if (bannedUserIds.length > 0 || bannedEmails.length > 0) {
+    const excludeConditions: any[] = [];
+    if (bannedUserIds.length > 0) {
+      excludeConditions.push({ _id: { $nin: bannedUserIds } });
+    }
+    if (bannedEmails.length > 0) {
+      excludeConditions.push({ email: { $nin: bannedEmails } });
+    }
+    
+    if (Object.keys(searchQuery).length > 0) {
+      searchQuery = { $and: [searchQuery, ...excludeConditions] };
+    } else {
+      searchQuery = { $and: excludeConditions };
+    }
+  }
+
+  const totalUsers = await User.countDocuments(searchQuery);
+  const ids = await User.find(searchQuery).select("_id").sort({ createdAt: -1 }).skip(skip).limit(limit);
   const views = await Promise.all(ids.map((u:any)=>walletView(String(u._id))));
   
   return res.json({ 
@@ -254,6 +433,48 @@ router.post("/admin/set-balance", requireAdmin, async (req, res) => {
   const user = await User.findByIdAndUpdate(userId, { available_balance: amount }, { new: true }).select("email name role createdAt available_balance reserved_balance");
   if (!user) return res.status(404).json({ error: "User not found" });
   return res.json({ user });
+});
+
+// Admin: update user
+const updateUserSchema = z.object({
+  name: z.string().min(2).max(50).optional(),
+  email: z.string().email().optional(),
+  role: z.enum(["user", "advertiser", "admin"]).optional(),
+  balance: z.number().min(0).optional(),
+  available_balance: z.number().min(0).optional(),
+  reserved_balance: z.number().min(0).optional(),
+  earned_balance: z.number().min(0).optional(),
+  reserved_earned_balance: z.number().min(0).optional(),
+});
+router.patch("/admin/users/:userId", requireAdmin, async (req, res) => {
+  try {
+    const parsed = updateUserSchema.safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
+    
+    const { userId } = req.params;
+    const updates: any = {};
+    
+    if (parsed.data.name !== undefined) updates.name = parsed.data.name;
+    if (parsed.data.email !== undefined) {
+      const exists = await User.findOne({ email: parsed.data.email, _id: { $ne: userId } });
+      if (exists) return res.status(409).json({ error: "Email already in use" });
+      updates.email = parsed.data.email;
+    }
+    if (parsed.data.role !== undefined) updates.role = parsed.data.role;
+    if (parsed.data.balance !== undefined) updates.balance = parsed.data.balance;
+    if (parsed.data.available_balance !== undefined) updates.available_balance = parsed.data.available_balance;
+    if (parsed.data.reserved_balance !== undefined) updates.reserved_balance = parsed.data.reserved_balance;
+    if (parsed.data.earned_balance !== undefined) updates.earned_balance = parsed.data.earned_balance;
+    if (parsed.data.reserved_earned_balance !== undefined) updates.reserved_earned_balance = parsed.data.reserved_earned_balance;
+    
+    const user = await User.findByIdAndUpdate(userId, updates, { new: true }).select("email name role createdAt balance available_balance reserved_balance earned_balance reserved_earned_balance");
+    if (!user) return res.status(404).json({ error: "User not found" });
+    
+    return res.json({ user });
+  } catch (e) {
+    console.error("User update error:", e);
+    return res.status(500).json({ error: "Internal server error" });
+  }
 });
 // Change password (auth required)
 const changePasswordSchema = z.object({ currentPassword: z.string().min(1), newPassword: z.string().min(6) });
