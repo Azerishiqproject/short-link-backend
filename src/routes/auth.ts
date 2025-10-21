@@ -87,7 +87,14 @@ router.post("/register", async (req, res) => {
 
   const parsed = registerSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
-  const { email, password, name, referralCode } = parsed.data; // role kaldırıldı
+  
+  // Güvenlik: Request body'den role field'ını tamamen temizle
+  const { email, password, name, referralCode } = parsed.data;
+  
+  // Ek güvenlik: Eğer request body'de role varsa reddet
+  if (req.body.role) {
+    return res.status(400).json({ error: "Role field is not allowed in registration" });
+  }
 
   // Check for bans before registration
   try {
@@ -560,6 +567,59 @@ router.post("/reset-password", async (req, res) => {
     return res.json({ ok: true });
   } catch (e) {
     return res.status(400).json({ error: "Invalid or expired token" });
+  }
+});
+
+// Admin: Kullanıcı rolünü değiştir (sadece admin yetkisi)
+const updateUserRoleSchema = z.object({
+  userId: z.string().min(1, "User ID is required"),
+  role: z.enum(["user", "admin", "advertiser"])
+});
+
+router.put("/admin/users/:userId/role", requireAdmin, async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const parsed = updateUserRoleSchema.safeParse({
+      userId,
+      ...req.body
+    });
+    
+    if (!parsed.success) {
+      return res.status(400).json({ error: parsed.error.flatten() });
+    }
+    
+    const { role } = parsed.data;
+    
+    // Güvenlik: Kendi rolünü değiştirmeyi engelle
+    const currentUserId = (req as any).user.sub;
+    if (userId === currentUserId) {
+      return res.status(400).json({ error: "Cannot change your own role" });
+    }
+    
+    // Kullanıcıyı bul ve güncelle
+    const user = await User.findByIdAndUpdate(
+      userId,
+      { role },
+      { new: true }
+    ).select("email name role createdAt");
+    
+    if (!user) {
+      return res.status(404).json({ error: "User not found" });
+    }
+    
+    return res.json({ 
+      message: "User role updated successfully",
+      user: {
+        id: user._id,
+        email: user.email,
+        name: user.name,
+        role: user.role,
+        createdAt: user.createdAt
+      }
+    });
+  } catch (error) {
+    console.error("Error updating user role:", error);
+    return res.status(500).json({ error: "Failed to update user role" });
   }
 });
 

@@ -83,3 +83,4 @@ async function testIPEarningsLimit() {
 
 // Test'i çalıştır
 testIPEarningsLimit();
+

@@ -22,6 +22,7 @@ import adminSupportRoutes from "./routes/admin/support";
 import adminReferralsRoutes from "./routes/admin/referrals";
 import adminBansRoutes from "./routes/admin/bans";
 import { banGuard } from "./middleware/security";
+import { JwtPayload } from "./middleware/auth";
 
 const app = express();
 // Respect X-Forwarded-* headers (for real client IP behind proxies)
@@ -46,10 +47,36 @@ app.options(/.*/, cors());
 app.use(helmet());
 app.use(express.json());
 app.use(morgan("dev"));
+// Helper function to check if user is admin
+function isAdminUser(req: any): boolean {
+  try {
+    const header = req.headers.authorization;
+    if (!header?.startsWith("Bearer ")) return false;
+    const token = header.slice(7);
+    const secret = process.env.JWT_SECRET;
+    if (!secret) return false;
+    const jwt = require("jsonwebtoken");
+    const payload = jwt.verify(token, secret) as JwtPayload;
+    return payload.role === "admin";
+  } catch (err) {
+    return false;
+  }
+}
+
 // Ban check must be early
 app.use(banGuard);
-// Global rate limit, but skip chat/support endpoints
-app.use(rateLimit({ windowMs: 15 * 60 * 1000, max: 200, skip: (req) => req.path?.startsWith("/api/support") === true }));
+// Global rate limit, but skip admin users and support endpoints
+app.use(rateLimit({ 
+  windowMs: 15 * 60 * 1000, 
+  max: 200, 
+  skip: (req) => {
+    // Skip rate limiting for admin users
+    if (isAdminUser(req)) return true;
+    // Skip rate limiting for support endpoints
+    if (req.path?.startsWith("/api/support") === true) return true;
+    return false;
+  }
+}));
 // Optional root response for uptime checks
 app.get("/", (_req, res) => res.send("Backend API is running"));
 
@@ -61,12 +88,12 @@ app.use("/api/pricing", pricingRoutes);
 app.use("/api/payments", paymentRoutes);
 app.use("/api/support", supportRoutes);
 app.use("/api/blog", blogRoutes);
+app.use("/api/admin/support", supportRoutes);
 app.use("/api/admin/blog", adminBlogRoutes);
 app.use("/api/admin/pricing", adminPricingRoutes);
 app.use("/api/admin/payments", adminPaymentsRoutes);
 app.use("/api/admin/campaigns", adminCampaignsRoutes);
 app.use("/api/admin/links", adminLinksRoutes);
-app.use("/api/admin/support", adminSupportRoutes);
 app.use("/api/admin/referrals", adminReferralsRoutes);
 app.use("/api/admin/bans", adminBansRoutes);
 

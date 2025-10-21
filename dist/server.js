@@ -23,7 +23,6 @@ const pricing_2 = __importDefault(require("./routes/admin/pricing"));
 const payments_2 = __importDefault(require("./routes/admin/payments"));
 const campaigns_2 = __importDefault(require("./routes/admin/campaigns"));
 const links_2 = __importDefault(require("./routes/admin/links"));
-const support_2 = __importDefault(require("./routes/admin/support"));
 const referrals_1 = __importDefault(require("./routes/admin/referrals"));
 const bans_1 = __importDefault(require("./routes/admin/bans"));
 const security_1 = require("./middleware/security");
@@ -51,10 +50,40 @@ app.options(/.*/, (0, cors_1.default)());
 app.use((0, helmet_1.default)());
 app.use(express_1.default.json());
 app.use((0, morgan_1.default)("dev"));
+// Helper function to check if user is admin
+function isAdminUser(req) {
+    try {
+        const header = req.headers.authorization;
+        if (!header?.startsWith("Bearer "))
+            return false;
+        const token = header.slice(7);
+        const secret = process.env.JWT_SECRET;
+        if (!secret)
+            return false;
+        const jwt = require("jsonwebtoken");
+        const payload = jwt.verify(token, secret);
+        return payload.role === "admin";
+    }
+    catch (err) {
+        return false;
+    }
+}
 // Ban check must be early
 app.use(security_1.banGuard);
-// Global rate limit, but skip chat/support endpoints
-app.use((0, express_rate_limit_1.default)({ windowMs: 15 * 60 * 1000, max: 200, skip: (req) => req.path?.startsWith("/api/support") === true }));
+// Global rate limit, but skip admin users and support endpoints
+app.use((0, express_rate_limit_1.default)({
+    windowMs: 15 * 60 * 1000,
+    max: 200,
+    skip: (req) => {
+        // Skip rate limiting for admin users
+        if (isAdminUser(req))
+            return true;
+        // Skip rate limiting for support endpoints
+        if (req.path?.startsWith("/api/support") === true)
+            return true;
+        return false;
+    }
+}));
 // Optional root response for uptime checks
 app.get("/", (_req, res) => res.send("Backend API is running"));
 app.get("/api/health", (_req, res) => res.json({ ok: true }));
@@ -65,18 +94,17 @@ app.use("/api/pricing", pricing_1.default);
 app.use("/api/payments", payments_1.default);
 app.use("/api/support", support_1.default);
 app.use("/api/blog", blog_1.default);
+app.use("/api/admin/support", support_1.default);
 app.use("/api/admin/blog", blog_2.default);
 app.use("/api/admin/pricing", pricing_2.default);
 app.use("/api/admin/payments", payments_2.default);
 app.use("/api/admin/campaigns", campaigns_2.default);
 app.use("/api/admin/links", links_2.default);
-app.use("/api/admin/support", support_2.default);
 app.use("/api/admin/referrals", referrals_1.default);
 app.use("/api/admin/bans", bans_1.default);
 async function start() {
     const mongoUri = process.env.MONGODB_URI ?? "mongodb://127.0.0.1:27017/shortlink";
     await mongoose_1.default.connect(mongoUri);
-    console.log("MongoDB connected:", mongoUri);
     const port = Number(process.env.PORT ?? 5050);
     app.listen(port, () => console.log(`API listening on http://localhost:${port}`));
 }
