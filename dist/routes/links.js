@@ -792,12 +792,33 @@ router.post('/impression', async (req, res) => {
         const session = (0, linkToken_1.getOrCreateAdSession)(payload.nonce, payload.shortLinkId, 10 * 60 * 1000);
         const already = session.stagesDone.has(stageNum);
         session.stagesDone.add(stageNum);
+        console.log("Impression request:", {
+            stage: stageNum,
+            linkId: payload.shortLinkId,
+            nonce: payload.nonce,
+            stagesDone: Array.from(session.stagesDone),
+            already
+        });
         // TODO: persist impression record if desired
         // If both stages completed, respond with redirect target
         if (session.stagesDone.size >= 2) {
             // Optional: expire session immediately to prevent further reuse
             (0, linkToken_1.clearAdSession)(payload.nonce);
             const link = await Link_1.Link.findById(session.linkId);
+            // Check if link exists
+            if (!link) {
+                console.error("Redirect failed: Link not found", session.linkId);
+                return res.status(404).json({
+                    error: 'link-not-found',
+                    message: 'Link bulunamadı'
+                });
+            }
+            console.log("Link found for redirect:", {
+                linkId: session.linkId,
+                targetUrl: link.targetUrl,
+                slug: link.slug,
+                ownerId: link.ownerId
+            });
             // Log click with real client IP (from impression request)
             if (link) {
                 const country = (0, geoService_1.getCountryFromIP)(ip);
@@ -839,10 +860,31 @@ router.post('/impression', async (req, res) => {
                 // Invalidate caches so stats/trend update immediately
                 invalidateAnalyticsCacheForLink(String(link._id), String(link.ownerId));
             }
+            // Ensure we have a valid redirect URL
+            const redirectUrl = link?.targetUrl;
+            console.log("Redirect URL check:", {
+                linkId: session.linkId,
+                targetUrl: link?.targetUrl,
+                targetUrlType: typeof link?.targetUrl,
+                targetUrlLength: link?.targetUrl?.length,
+                isEmpty: !link?.targetUrl,
+                isNullOrUndefined: link?.targetUrl == null
+            });
+            if (!redirectUrl || redirectUrl.trim() === '') {
+                console.error("Redirect failed: No valid targetUrl found for link", {
+                    linkId: session.linkId,
+                    targetUrl: link?.targetUrl,
+                    linkExists: !!link
+                });
+                return res.status(500).json({
+                    error: 'redirect-url-missing',
+                    message: 'Hedef URL bulunamadı veya boş'
+                });
+            }
             return res.json({
                 ok: true,
                 done: true,
-                redirect: link?.targetUrl || null,
+                redirect: redirectUrl,
                 linkId: session.linkId,
                 suspicious,
                 ip,

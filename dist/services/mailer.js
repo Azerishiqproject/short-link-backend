@@ -30,6 +30,11 @@ function getTransporter() {
 }
 async function verifySmtp() {
     try {
+        // SMTP ayarları yoksa skip et
+        if (!process.env.SMTP_HOST || !process.env.SMTP_USER || !process.env.SMTP_PASS) {
+            console.log("SMTP not configured, skipping verification");
+            return;
+        }
         const t = getTransporter();
         await t.verify();
         if (process.env.EMAIL_DEBUG === "1") {
@@ -41,9 +46,14 @@ async function verifySmtp() {
     }
 }
 async function sendMail({ to, subject, html }) {
+    // SMTP ayarları yoksa sadece log yaz
+    if (!process.env.SMTP_HOST || !process.env.SMTP_USER || !process.env.SMTP_PASS) {
+        console.log(`Email would be sent to ${to}: ${subject}`);
+        return { messageId: "mock-id" };
+    }
     const from = process.env.MAIL_FROM || process.env.SMTP_USER || "no-reply@example.com";
     const t = getTransporter();
     if (process.env.EMAIL_DEBUG === "1") {
     }
-    await t.sendMail({ from, to, subject, html });
+    return t.sendMail({ from, to, subject, html });
 }
