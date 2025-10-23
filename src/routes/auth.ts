@@ -51,7 +51,7 @@ async function walletView(userId: string) {
   }
   
   const sanitizedUserId = mongoSanitize.sanitizeQuery({ _id: userId });
-  const user = await User.findById(sanitizedUserId._id).select("email name role createdAt available_balance reserved_balance earned_balance reserved_earned_balance referral_earned reserved_referral_earned iban fullName paymentDescription referralCode referralCount referredBy").lean();
+  const user = await User.findById(sanitizedUserId._id).select("email name role createdAt available_balance reserved_balance earned_balance reserved_earned_balance referral_earned reserved_referral_earned iban fullName paymentDescription referralCode referralCount referredBy registrationIp lastLoginIp registrationDeviceId deviceIds").lean();
   if (!user) return null;
   
   const sanitizedOwnerQuery = mongoSanitize.sanitizeQuery({ ownerId: userId });
@@ -297,7 +297,13 @@ router.post("/refresh", async (req, res) => {
     const { refreshToken } = req.body as { refreshToken?: string };
     if (!refreshToken) return res.status(400).json({ error: "Missing refreshToken" });
     const decoded = jwt.verify(refreshToken, getJwtSecret()) as { sub: string };
-    const token = signAccess({ sub: decoded.sub });
+    
+    // Kullanıcının güncel rolünü veritabanından al
+    const user = await User.findById(decoded.sub).select('role');
+    if (!user) return res.status(401).json({ error: "User not found" });
+    
+    // Yeni token'ı kullanıcının güncel rolü ile oluştur
+    const token = signAccess({ sub: decoded.sub, role: user.role });
     return res.json({ token });
   } catch (e) {
     return res.status(401).json({ error: "Invalid refresh token" });

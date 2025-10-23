@@ -26,7 +26,47 @@ router.get("/", auth_1.requireAdmin, async (req, res) => {
         return res.status(500).json({ error: "Ban listesi getirilemedi" });
     }
 });
-// Create ban (by email, IP or deviceId)
+// Create comprehensive ban (user ban with all IPs and devices)
+router.post("/comprehensive", auth_1.requireAdmin, async (req, res) => {
+    try {
+        const { email, emails, ips, deviceIds, reason, expiresAt, userId } = req.body;
+        if (!email && (!emails || emails.length === 0)) {
+            return res.status(400).json({ error: "Email gerekli" });
+        }
+        const doc = {
+            reason,
+            active: true,
+            banType: "comprehensive",
+            createdBy: req.user.sub
+        };
+        if (userId)
+            doc.userId = userId;
+        if (email)
+            doc.email = email;
+        if (emails && emails.length > 0)
+            doc.emails = emails;
+        if (ips && ips.length > 0)
+            doc.ips = ips;
+        if (deviceIds && deviceIds.length > 0)
+            doc.deviceIds = deviceIds;
+        if (expiresAt)
+            doc.expiresAt = new Date(expiresAt);
+        const ban = await Ban_1.Ban.create(doc);
+        console.log("Comprehensive ban oluşturuldu:", {
+            email: email || emails,
+            ips: ips || [],
+            deviceIds: deviceIds || [],
+            reason,
+            expiresAt
+        });
+        return res.status(201).json({ ban });
+    }
+    catch (e) {
+        console.error("Comprehensive ban hatası:", e);
+        return res.status(500).json({ error: "Comprehensive ban oluşturulamadı" });
+    }
+});
+// Create ban (by email, IP or deviceId) - eski sistem
 router.post("/", auth_1.requireAdmin, async (req, res) => {
     try {
         const parsed = createBanSchema.safeParse(req.body);
@@ -35,7 +75,7 @@ router.post("/", auth_1.requireAdmin, async (req, res) => {
         const { email, ip, deviceId, reason, expiresAt } = parsed.data;
         if (!email && !ip && !deviceId)
             return res.status(400).json({ error: "email, ip veya deviceId gerekli" });
-        const doc = { reason, active: true };
+        const doc = { reason, active: true, banType: "single" };
         if (email)
             doc.email = email;
         if (ip)
@@ -45,6 +85,12 @@ router.post("/", auth_1.requireAdmin, async (req, res) => {
         if (expiresAt)
             doc.expiresAt = new Date(expiresAt);
         const ban = await Ban_1.Ban.create(doc);
+        console.log("Ban oluşturuldu:", {
+            type: email ? 'email' : ip ? 'ip' : 'deviceId',
+            value: email || ip || deviceId,
+            reason,
+            expiresAt
+        });
         return res.status(201).json({ ban });
     }
     catch (e) {

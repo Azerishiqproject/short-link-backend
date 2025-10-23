@@ -81,6 +81,7 @@ async function banGuard(req, res, next) {
         const deviceId = typeof deviceIdHeader === "string" ? deviceIdHeader.trim() : Array.isArray(deviceIdHeader) ? deviceIdHeader[0]?.trim() : undefined;
         const baseExpiry = { $or: [{ expiresAt: { $exists: false } }, { expiresAt: null }, { expiresAt: { $gt: now } }] };
         const orConds = [];
+        // Eski sistem banları (tek değer)
         if (ip)
             orConds.push({ ip, active: true, ...baseExpiry });
         if (mac)
@@ -103,9 +104,49 @@ async function banGuard(req, res, next) {
                 // Ignore email check errors
             }
         }
-        if (orConds.length === 0)
+        // Yeni comprehensive ban kontrolü
+        const comprehensiveConds = [];
+        // IP kontrolü - comprehensive ban'larda
+        if (ip) {
+            comprehensiveConds.push({
+                ips: ip,
+                active: true,
+                banType: "comprehensive",
+                ...baseExpiry
+            });
+        }
+        // Device ID kontrolü - comprehensive ban'larda
+        if (deviceId) {
+            comprehensiveConds.push({
+                deviceIds: deviceId,
+                active: true,
+                banType: "comprehensive",
+                ...baseExpiry
+            });
+        }
+        // Email kontrolü - comprehensive ban'larda
+        if (userId) {
+            try {
+                const User = require('../models/User').User;
+                const user = await User.findById(userId).select('email').lean();
+                if (user?.email) {
+                    comprehensiveConds.push({
+                        emails: user.email,
+                        active: true,
+                        banType: "comprehensive",
+                        ...baseExpiry
+                    });
+                }
+            }
+            catch (e) {
+                // Ignore email check errors
+            }
+        }
+        // Tüm koşulları birleştir
+        const allConds = [...orConds, ...comprehensiveConds];
+        if (allConds.length === 0)
             return next();
-        const banned = await Ban_1.Ban.findOne({ $or: orConds }).lean();
+        const banned = await Ban_1.Ban.findOne({ $or: allConds }).lean();
         if (banned) {
             return res.status(403).json({ error: "Erişim engellendi" });
         }
