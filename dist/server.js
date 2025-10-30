@@ -25,6 +25,9 @@ const campaigns_2 = __importDefault(require("./routes/admin/campaigns"));
 const links_2 = __importDefault(require("./routes/admin/links"));
 const referrals_1 = __importDefault(require("./routes/admin/referrals"));
 const bans_1 = __importDefault(require("./routes/admin/bans"));
+const contact_1 = __importDefault(require("./routes/admin/contact"));
+const adminAds_1 = __importDefault(require("./routes/adminAds"));
+const contact_2 = __importDefault(require("./routes/contact"));
 const security_1 = require("./middleware/security");
 const app = (0, express_1.default)();
 // Respect X-Forwarded-* headers (for real client IP behind proxies)
@@ -94,6 +97,7 @@ app.use("/api/pricing", pricing_1.default);
 app.use("/api/payments", payments_1.default);
 app.use("/api/support", support_1.default);
 app.use("/api/blog", blog_1.default);
+app.use("/api/contact", contact_2.default);
 app.use("/api/admin/support", support_1.default);
 app.use("/api/admin/blog", blog_2.default);
 app.use("/api/admin/pricing", pricing_2.default);
@@ -102,6 +106,9 @@ app.use("/api/admin/campaigns", campaigns_2.default);
 app.use("/api/admin/links", links_2.default);
 app.use("/api/admin/referrals", referrals_1.default);
 app.use("/api/admin/bans", bans_1.default);
+app.use("/api/admin/contact", contact_1.default);
+app.use("/api/admin/admin-ads", adminAds_1.default);
+app.use("/api/admin-ads", adminAds_1.default);
 async function start() {
     const mongoUri = process.env.MONGODB_URI ?? "mongodb://127.0.0.1:27017/shortlink";
     await mongoose_1.default.connect(mongoUri, {

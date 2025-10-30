@@ -4,6 +4,7 @@ import bcrypt from "bcrypt";
 import jwt from "jsonwebtoken";
 import mongoose from "mongoose";
 import { User } from "../models/User";
+import { EmailVerification } from "../models/EmailVerification";
 import { Campaign } from "../models/Campaign";
 import { requireAuth, requireAdmin } from "../middleware/auth";
 import { sendMail, verifySmtp } from "../services/mailer";
@@ -70,6 +71,10 @@ const registerSchema = z.object({
   // role: z.enum(["user", "advertiser"]).optional(), // Reklam veren rolü geçici olarak devre dışı
   referralCode: z.string().length(6).optional(), // 6 karakterli referans kodu (opsiyonel)
 });
+
+function generateVerificationCode(): string {
+  return Math.floor(100000 + Math.random() * 900000).toString();
+}
 
 router.post("/register", async (req, res) => {
   const ip = getClientIp(req);
@@ -146,51 +151,52 @@ router.post("/register", async (req, res) => {
   }
   
   const passwordHash = await bcrypt.hash(password, 10);
-  
-  // Benzersiz referans kodu oluştur
-  const userReferralCode = await generateUniqueReferralCode();
-  
-  // Kullanıcı oluştur - Reklam veren rolü geçici olarak devre dışı
-  const user = await User.create({ 
-    email, 
-    passwordHash, 
-    name, 
-    role: "user", // role || "user" yerine sadece "user" - reklam veren kaldırıldı
-    available_balance: 0, 
-    reserved_balance: 0,
-    referralCode: userReferralCode,
-    referredBy: referrer ? referrer._id : undefined,
+
+  // Eski tam-kayıt yerine e-posta doğrulama beklemeye alın
+  // Varsa önceki bekleyen kaydı sil/üstüne yaz
+  await EmailVerification.deleteMany({ email });
+  const code = generateVerificationCode();
+  const expiresAt = new Date(Date.now() + 15 * 60 * 1000); // 15 dakika
+  const pending = await EmailVerification.create({
+    email,
+    passwordHash,
+    name,
+    referralCodeInput: referralCode,
+    referrerId: referrer ? referrer._id : undefined,
     registrationIp: ip,
     registrationDeviceId: deviceId,
+    code,
+    expiresAt,
   });
-  
-  // Referans eden kullanıcının referans sayısını artır
-  if (referrer) {
-    await User.findByIdAndUpdate(referrer._id, { 
-      $inc: { referralCount: 1 } 
-    });
-    
-    // Referans kazanç işlemini başlat (asenkron)
-    referralService.processRegistrationReferral(user._id.toString()).catch(error => {
-      console.error("Registration referral processing error:", error);
-    });
+
+  // Doğrulama e-postası gönder
+  const mailFromName = process.env.MAIL_FROM?.split('<')[0].trim() || "Glorta";
+  const primaryColor = process.env.EMAIL_PRIMARY_COLOR || "#4f46e5";
+  const html = `
+    <div style="font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; max-width: 600px; margin: auto; border: 1px solid #e0e0e0; border-radius: 8px; overflow: hidden; background-color: #ffffff;">
+      <div style="background: linear-gradient(to right, #6366f1, #a855f7); padding: 20px; text-align: center; color: #ffffff; border-bottom: 1px solid #e0e0e0;">
+        <h1 style="margin: 0; font-size: 24px;">${mailFromName}</h1>
+      </div>
+      <div style="padding: 30px; text-align: center;">
+        <h2 style="color: #333333; font-size: 22px; margin-bottom: 20px;">E-posta Doğrulama</h2>
+        <p style="color: #555555; font-size: 15px; line-height: 1.6; margin-bottom: 25px;">
+          Merhaba ${name || ''},<br/><br/>
+          Kaydınızı tamamlamak için aşağıdaki doğrulama kodunu kullanın:
+        </p>
+        <div style="font-size: 28px; letter-spacing: 6px; font-weight: 700; color: ${primaryColor}; margin: 10px 0 20px;">${code}</div>
+        <p style="color: #777777; font-size: 13px;">Bu kod 15 dakika içinde geçerlidir.</p>
+      </div>
+    </div>
+  `;
+  try {
+    await sendMail({ to: email, subject: "E-posta Doğrulama Kodu", html });
+  } catch (e) {
+    // E-posta gönderilemezse pending kaydı temizleyip hata döndür
+    await EmailVerification.deleteOne({ _id: pending._id });
+    return res.status(500).json({ error: "Doğrulama e-postası gönderilemedi" });
   }
-  
-  const token = signAccess({ sub: String(user._id), role: user.role });
-  const refresh = signRefresh({ sub: String(user._id) });
-  return res.status(201).json({ 
-    token, 
-    refreshToken: refresh, 
-    user: { 
-      id: user._id, 
-      email: user.email, 
-      name: user.name, 
-      role: user.role, 
-      available_balance: user.available_balance, 
-      reserved_balance: user.reserved_balance,
-      referralCode: user.referralCode
-    } 
-  });
+
+  return res.status(200).json({ verificationId: String(pending._id) });
 });
 
 const loginSchema = z.object({ 
@@ -458,6 +464,7 @@ const updateUserSchema = z.object({
   reserved_balance: z.number().min(0).optional(),
   earned_balance: z.number().min(0).optional(),
   reserved_earned_balance: z.number().min(0).optional(),
+  referralCode: z.string().length(6).regex(/^[A-Z0-9]{6}$/).optional(),
 });
 router.patch("/admin/users/:userId", requireAdmin, async (req, res) => {
   try {
@@ -474,13 +481,20 @@ router.patch("/admin/users/:userId", requireAdmin, async (req, res) => {
       updates.email = parsed.data.email;
     }
     if (parsed.data.role !== undefined) updates.role = parsed.data.role;
+    if (parsed.data.referralCode !== undefined) {
+      // Ensure uppercase and unique across other users
+      const newCode = parsed.data.referralCode.toUpperCase();
+      const existsCode = await User.findOne({ referralCode: newCode, _id: { $ne: userId } }).select('_id');
+      if (existsCode) return res.status(409).json({ error: "Referral code already in use" });
+      updates.referralCode = newCode;
+    }
     if (parsed.data.balance !== undefined) updates.balance = parsed.data.balance;
     if (parsed.data.available_balance !== undefined) updates.available_balance = parsed.data.available_balance;
     if (parsed.data.reserved_balance !== undefined) updates.reserved_balance = parsed.data.reserved_balance;
     if (parsed.data.earned_balance !== undefined) updates.earned_balance = parsed.data.earned_balance;
     if (parsed.data.reserved_earned_balance !== undefined) updates.reserved_earned_balance = parsed.data.reserved_earned_balance;
     
-    const user = await User.findByIdAndUpdate(userId, updates, { new: true }).select("email name role createdAt balance available_balance reserved_balance earned_balance reserved_earned_balance");
+    const user = await User.findByIdAndUpdate(userId, updates, { new: true }).select("email name role createdAt balance available_balance reserved_balance earned_balance reserved_earned_balance referralCode referral_earned reserved_referral_earned referralCount registrationIp lastLoginIp registrationDeviceId deviceIds");
     if (!user) return res.status(404).json({ error: "User not found" });
     
     return res.json({ user });
@@ -521,7 +535,7 @@ router.post("/forgot-password", async (req, res) => {
   const token = jwt.sign({ sub: String(user._id), type: "reset" }, secret, { expiresIn: "15m" });
   const appUrl = process.env.APP_URL || "http://localhost:3000";
   const resetUrl = `${appUrl}/reset-password?token=${encodeURIComponent(token)}`;
-  const mailFromName = process.env.MAIL_FROM?.split('<')[0].trim() || "Tr.link";
+  const mailFromName = process.env.MAIL_FROM?.split('<')[0].trim() || "Glorta";
   const primaryColor = process.env.EMAIL_PRIMARY_COLOR || "#4f46e5"; // Default indigo-600
 
   const html = `
@@ -574,6 +588,109 @@ router.post("/reset-password", async (req, res) => {
   } catch (e) {
     return res.status(400).json({ error: "Invalid or expired token" });
   }
+});
+
+// Verify email code and create the actual user
+const verifyEmailSchema = z.object({ verificationId: z.string().min(1), code: z.string().length(6) });
+router.post("/verify-email", async (req, res) => {
+  const parsed = verifyEmailSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
+  const { verificationId, code } = parsed.data;
+  const pending = await EmailVerification.findById(verificationId);
+  if (!pending) return res.status(400).json({ error: "Doğrulama oturumu bulunamadı" });
+  if (pending.expiresAt < new Date()) {
+    await EmailVerification.deleteOne({ _id: pending._id });
+    return res.status(400).json({ error: "Kodun süresi doldu" });
+  }
+  if (pending.code !== code) {
+    const attempts = (pending.attempts || 0) + 1;
+    if (attempts >= 6) {
+      await EmailVerification.deleteOne({ _id: pending._id });
+      return res.status(429).json({ error: "Çok fazla hatalı kod denemesi" });
+    }
+    await EmailVerification.updateOne({ _id: pending._id }, { $set: { attempts } });
+    return res.status(400).json({ error: "Kod hatalı" });
+  }
+
+  // Re-check email uniqueness right before creation
+  const existing = await User.findOne({ email: pending.email });
+  if (existing) {
+    await EmailVerification.deleteOne({ _id: pending._id });
+    return res.status(409).json({ error: "Email already in use" });
+  }
+
+  // Generate user's own referral code and create the user
+  const userReferralCode = await generateUniqueReferralCode();
+  const user = await User.create({
+    email: pending.email,
+    passwordHash: pending.passwordHash,
+    name: pending.name,
+    role: "user",
+    available_balance: 0,
+    reserved_balance: 0,
+    referralCode: userReferralCode,
+    referredBy: pending.referrerId,
+    registrationIp: pending.registrationIp,
+    registrationDeviceId: pending.registrationDeviceId,
+  });
+
+  // Referral side-effects
+  if (pending.referrerId) {
+    await User.findByIdAndUpdate(pending.referrerId, { $inc: { referralCount: 1 } });
+    referralService.processRegistrationReferral(String(user._id)).catch(() => {});
+  }
+
+  await EmailVerification.deleteOne({ _id: pending._id });
+
+  const token = signAccess({ sub: String(user._id), role: user.role });
+  const refresh = signRefresh({ sub: String(user._id) });
+  return res.status(201).json({
+    token,
+    refreshToken: refresh,
+    user: {
+      id: user._id,
+      email: user.email,
+      name: user.name,
+      role: user.role,
+      available_balance: user.available_balance,
+      reserved_balance: user.reserved_balance,
+      referralCode: user.referralCode,
+    },
+  });
+});
+
+// Resend verification code
+const resendSchema = z.object({ verificationId: z.string().min(1) });
+router.post("/resend-code", async (req, res) => {
+  const parsed = resendSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
+  const { verificationId } = parsed.data;
+  const pending = await EmailVerification.findById(verificationId);
+  if (!pending) return res.status(400).json({ error: "Doğrulama oturumu bulunamadı" });
+  const code = generateVerificationCode();
+  const expiresAt = new Date(Date.now() + 15 * 60 * 1000);
+  await EmailVerification.updateOne({ _id: verificationId }, { $set: { code, expiresAt, attempts: 0 } });
+
+  const mailFromName = process.env.MAIL_FROM?.split('<')[0].trim() || "Tr.link";
+  const primaryColor = process.env.EMAIL_PRIMARY_COLOR || "#4f46e5";
+  const html = `
+    <div style="font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; max-width: 600px; margin: auto; border: 1px solid #e0e0e0; border-radius: 8px; overflow: hidden; background-color: #ffffff;">
+      <div style="background: linear-gradient(to right, #6366f1, #a855f7); padding: 20px; text-align: center; color: #ffffff; border-bottom: 1px solid #e0e0e0;">
+        <h1 style="margin: 0; font-size: 24px;">${mailFromName}</h1>
+      </div>
+      <div style="padding: 30px; text-align: center;">
+        <h2 style="color: #333333; font-size: 22px; margin-bottom: 20px;">Doğrulama Kodu</h2>
+        <div style="font-size: 28px; letter-spacing: 6px; font-weight: 700; color: ${primaryColor}; margin: 10px 0 20px;">${code}</div>
+        <p style="color: #777777; font-size: 13px;">Bu kod 15 dakika içinde geçerlidir.</p>
+      </div>
+    </div>
+  `;
+  try {
+    await sendMail({ to: pending.email, subject: "Doğrulama Kodu", html });
+  } catch (e) {
+    return res.status(500).json({ error: "Kod gönderilemedi" });
+  }
+  return res.json({ ok: true });
 });
 
 // Admin: Kullanıcı rolünü değiştir (sadece admin yetkisi)

@@ -290,6 +290,14 @@ exports.mongoSanitize = {
     // Validate ObjectId format
     isValidObjectId: (id) => {
         return /^[0-9a-fA-F]{24}$/.test(id);
+    },
+    // Sanitize input strings
+    sanitizeInput: (input) => {
+        if (typeof input !== 'string')
+            return input;
+        return input
+            .replace(/[<>'";]/g, '') // Remove potentially dangerous characters
+            .trim();
     }
 };
 // Content Security Policy headers

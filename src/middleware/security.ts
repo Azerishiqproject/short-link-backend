@@ -301,6 +301,14 @@ export const mongoSanitize = {
   // Validate ObjectId format
   isValidObjectId: (id: string): boolean => {
     return /^[0-9a-fA-F]{24}$/.test(id);
+  },
+
+  // Sanitize input strings
+  sanitizeInput: (input: string): string => {
+    if (typeof input !== 'string') return input;
+    return input
+      .replace(/[<>'";]/g, '') // Remove potentially dangerous characters
+      .trim();
   }
 };
 

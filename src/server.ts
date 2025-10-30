@@ -21,6 +21,9 @@ import adminLinksRoutes from "./routes/admin/links";
 import adminSupportRoutes from "./routes/admin/support";
 import adminReferralsRoutes from "./routes/admin/referrals";
 import adminBansRoutes from "./routes/admin/bans";
+import adminContactRoutes from "./routes/admin/contact";
+import adminAdsRoutes from "./routes/adminAds";
+import contactRoutes from "./routes/contact";
 import { banGuard } from "./middleware/security";
 import { JwtPayload } from "./middleware/auth";
 
@@ -88,6 +91,7 @@ app.use("/api/pricing", pricingRoutes);
 app.use("/api/payments", paymentRoutes);
 app.use("/api/support", supportRoutes);
 app.use("/api/blog", blogRoutes);
+app.use("/api/contact", contactRoutes);
 app.use("/api/admin/support", supportRoutes);
 app.use("/api/admin/blog", adminBlogRoutes);
 app.use("/api/admin/pricing", adminPricingRoutes);
@@ -96,6 +100,9 @@ app.use("/api/admin/campaigns", adminCampaignsRoutes);
 app.use("/api/admin/links", adminLinksRoutes);
 app.use("/api/admin/referrals", adminReferralsRoutes);
 app.use("/api/admin/bans", adminBansRoutes);
+app.use("/api/admin/contact", adminContactRoutes);
+app.use("/api/admin/admin-ads", adminAdsRoutes);
+app.use("/api/admin-ads", adminAdsRoutes);
 
 async function start() {
   const mongoUri = process.env.MONGODB_URI ?? "mongodb://127.0.0.1:27017/shortlink";
