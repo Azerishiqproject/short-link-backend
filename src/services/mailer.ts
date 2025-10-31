@@ -1,4 +1,11 @@
 import nodemailer from "nodemailer";
+// Brevo (Sendinblue) HTTP API client – used when BREVO_API_KEY is set
+let BrevoApi: any = null;
+try {
+  // Lazy import to avoid runtime error if package is not installed yet
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  BrevoApi = require('sib-api-v3-sdk');
+} catch {}
 
 export type SendMailOptions = {
   to: string;
@@ -7,6 +14,7 @@ export type SendMailOptions = {
 };
 
 let transporter: nodemailer.Transporter | null = null;
+let brevoClient: any | null = null;
 
 function getTransporter() {
   if (transporter) return transporter;
@@ -33,6 +41,10 @@ function getTransporter() {
 
 export async function verifySmtp() {
   try {
+    // Brevo HTTP API kullanılıyorsa SMTP verify'i atla
+    if (process.env.BREVO_API_KEY) {
+      return;
+    }
     // SMTP ayarları yoksa skip et
     if (!process.env.SMTP_HOST || !process.env.SMTP_USER || !process.env.SMTP_PASS) {
       console.log("SMTP not configured, skipping verification");
@@ -50,16 +62,39 @@ export async function verifySmtp() {
 }
 
 export async function sendMail({ to, subject, html }: SendMailOptions) {
-  // SMTP ayarları yoksa sadece log yaz
+  // Prefer Brevo HTTP API if configured (avoids blocked SMTP ports on PaaS like Render)
+  if (process.env.BREVO_API_KEY && BrevoApi) {
+    try {
+      if (!brevoClient) {
+        const defaultClient = BrevoApi.ApiClient.instance;
+        const apiKey = defaultClient.authentications['api-key'];
+        apiKey.apiKey = process.env.BREVO_API_KEY as string;
+        brevoClient = new BrevoApi.TransactionalEmailsApi();
+      }
+      const fromRaw = process.env.MAIL_FROM || "Glorta <no-reply@glorta.io>";
+      const match = fromRaw.match(/^(.*)\s*<([^>]+)>\s*$/);
+      const sender = match ? { name: match[1].trim(), email: match[2].trim() } : { name: "Glorta", email: fromRaw };
+      const sendSmtpEmail = {
+        sender,
+        to: [{ email: to }],
+        subject,
+        htmlContent: html,
+      } as any;
+      const res = await brevoClient.sendTransacEmail(sendSmtpEmail);
+      return { messageId: res?.messageId || res?.messageId || 'brevo' };
+    } catch (e) {
+      console.error('Brevo send error:', e);
+      throw e;
+    }
+  }
+
+  // Fallback to SMTP (works only if your provider/network allows it)
   if (!process.env.SMTP_HOST || !process.env.SMTP_USER || !process.env.SMTP_PASS) {
     console.log(`Email would be sent to ${to}: ${subject}`);
     return { messageId: "mock-id" };
   }
-  
   const from = process.env.MAIL_FROM || process.env.SMTP_USER || "no-reply@example.com";
   const t = getTransporter();
-  if (process.env.EMAIL_DEBUG === "1") {
-  }
   return t.sendMail({ from, to, subject, html });
 }
 
